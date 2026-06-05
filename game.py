@@ -184,8 +184,9 @@ class Game:
         states, mcts_probs, current_players = [], [], []
         moves_history = []
         while True:
+            move_temp = temp(len(moves_history), self.board) if callable(temp) else temp
             move, move_probs = player.get_action(self.board,
-                                                 temp=temp,
+                                                 temp=move_temp,
                                                  return_prob=1)
             # store the data
             states.append(self.board.current_state())

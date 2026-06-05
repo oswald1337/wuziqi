@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Wuziqi Checkpoint Arena</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="play-surface" aria-label="Wuziqi board">
+        <div class="board-header">
+          <div>
+            <h1>Wuziqi</h1>
+            <p id="statusText">Loading agents...</p>
+          </div>
+          <div class="score-strip">
+            <span id="agentName">Agent</span>
+            <strong id="agentElo">--</strong>
+          </div>
+        </div>
+
+        <div id="board" class="board" aria-label="Game board"></div>
+      </section>
+
+      <aside class="control-panel" aria-label="Game controls">
+        <label>
+          Agent checkpoint
+          <select id="agentSelect"></select>
+        </label>
+
+        <label>
+          Play as
+          <select id="sideSelect">
+            <option value="1">Black, first</option>
+            <option value="2">White, second</option>
+          </select>
+        </label>
+
+        <div class="button-row">
+          <button id="newGameButton" type="button">New game</button>
+          <button id="resignButton" type="button" class="secondary">Resign</button>
+        </div>
+
+        <dl class="game-facts">
+          <div>
+            <dt>Board</dt>
+            <dd id="boardFact">--</dd>
+          </div>
+          <div>
+            <dt>Turn</dt>
+            <dd id="turnFact">--</dd>
+          </div>
+          <div>
+            <dt>Result</dt>
+            <dd id="resultFact">--</dd>
+          </div>
+        </dl>
+
+        <section class="telemetry" aria-label="Checkpoint telemetry">
+          <div class="panel-heading">
+            <h2>Telemetry</h2>
+            <span id="presetBadge">--</span>
+          </div>
+
+          <dl class="metric-grid">
+            <div>
+              <dt>Elo</dt>
+              <dd id="metricElo">--</dd>
+            </div>
+            <div>
+              <dt>Games</dt>
+              <dd id="metricGames">--</dd>
+            </div>
+            <div>
+              <dt>Replay</dt>
+              <dd id="metricReplay">--</dd>
+            </div>
+            <div>
+              <dt>Expert</dt>
+              <dd id="metricExpert">--</dd>
+            </div>
+            <div>
+              <dt>Anchor</dt>
+              <dd id="metricAnchor">--</dd>
+            </div>
+            <div>
+              <dt>Puzzles</dt>
+              <dd id="metricPuzzles">--</dd>
+            </div>
+            <div>
+              <dt>Playouts</dt>
+              <dd id="metricPlayouts">--</dd>
+            </div>
+            <div>
+              <dt>Mode</dt>
+              <dd id="metricMode">--</dd>
+            </div>
+            <div>
+              <dt>Loss</dt>
+              <dd id="metricLoss">--</dd>
+            </div>
+            <div>
+              <dt>Policy Loss</dt>
+              <dd id="metricPolicyLoss">--</dd>
+            </div>
+            <div>
+              <dt>Value Loss</dt>
+              <dd id="metricValueLoss">--</dd>
+            </div>
+            <div>
+              <dt>Entropy</dt>
+              <dd id="metricEntropy">--</dd>
+            </div>
+            <div>
+              <dt>Model</dt>
+              <dd id="metricModel">--</dd>
+            </div>
+            <div>
+              <dt>Promotion</dt>
+              <dd id="metricPromotion">--</dd>
+            </div>
+            <div>
+              <dt>Completion Gate</dt>
+              <dd id="metricGate">--</dd>
+            </div>
+            <div>
+              <dt>Init</dt>
+              <dd id="metricInit">--</dd>
+            </div>
+            <div>
+              <dt>Seed</dt>
+              <dd id="metricSeed">--</dd>
+            </div>
+          </dl>
+
+          <div id="gateChecks" class="gate-checks"></div>
+
+          <div id="lossChart" class="loss-chart" aria-label="Training loss chart"></div>
+
+          <div class="eval-table" aria-label="Evaluation record">
+            <div class="eval-row eval-head">
+              <span>Opponent</span>
+              <span>W</span>
+              <span>D</span>
+              <span>L</span>
+              <span>Score</span>
+            </div>
+            <div id="evalRows"></div>
+          </div>
+
+          <ol id="selfPlayList" class="self-play-list"></ol>
+        </section>
+
+        <section class="training-status" aria-label="Training status">
+          <div class="panel-heading">
+            <h2>Goal</h2>
+            <span id="goalStatus">active</span>
+          </div>
+
+          <div class="status-actions">
+            <button id="refreshStatusButton" type="button" class="secondary">Refresh status</button>
+            <span id="lastRefresh">--</span>
+          </div>
+
+          <dl class="metric-grid">
+            <div>
+              <dt>Target Elo</dt>
+              <dd id="targetElo">--</dd>
+            </div>
+            <div>
+              <dt>Best Elo</dt>
+              <dd id="bestElo">--</dd>
+            </div>
+            <div>
+              <dt>Heuristic Gate</dt>
+              <dd id="heuristicGate">--</dd>
+            </div>
+            <div>
+              <dt>Previous Gate</dt>
+              <dd id="previousGate">--</dd>
+            </div>
+            <div>
+              <dt>Promotion</dt>
+              <dd id="promotionGate">--</dd>
+            </div>
+            <div>
+              <dt>Log</dt>
+              <dd id="logPath">--</dd>
+            </div>
+            <div>
+              <dt>Registry</dt>
+              <dd id="registryPath">--</dd>
+            </div>
+            <div>
+              <dt>Config</dt>
+              <dd id="configPath">--</dd>
+            </div>
+          </dl>
+
+          <div class="leaderboard" aria-label="Elo ladder">
+            <div class="ladder-row ladder-head">
+              <span>Checkpoint</span>
+              <span>Elo</span>
+              <span>Status</span>
+            </div>
+            <div id="leaderboardRows"></div>
+          </div>
+
+          <pre id="logTail" class="log-tail" aria-label="Training log"></pre>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

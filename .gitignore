@@ -1,11 +1,18 @@
+.venv/
 __pycache__/
-# model files
-*.model
-# logs
-logs/
-# wandb
-wandb/
-# for now
-uv.lock
-# idk
+.pytest_cache/
+.pycache_check/
+.pycache_compile/
+*.pyc
+*.egg-info/
+.DS_Store
+
 train.log
+logs/
+wandb/
+checkpoints/
+current_policy.model
+best_policy.model
+*.model
+uv.lock
+ssh/
