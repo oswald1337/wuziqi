@@ -1,4 +1,6 @@
 import unittest
+import copy
+import numpy as np
 from game import Board
 
 class TestBoard(unittest.TestCase):
@@ -52,6 +54,29 @@ class TestBoard(unittest.TestCase):
             self.board.do_move(m)
         win, winner = self.board.has_a_winner()
         self.assertFalse(win)
+
+    def test_board_copy_is_independent(self):
+        for move in [0, 15, 1, 16]:
+            self.board.do_move(move)
+
+        copied = self.board.copy()
+        deep_copied = copy.deepcopy(self.board)
+
+        copied.do_move(2)
+        deep_copied.do_move(2)
+
+        self.assertNotIn(2, self.board.states)
+        self.assertIn(2, self.board.availables)
+        self.assertEqual(copied.states[2], self.board.players[0])
+        self.assertEqual(deep_copied.states[2], self.board.players[0])
+        self.assertEqual(self.board.last_move, 16)
+
+    def test_current_state_uses_float32(self):
+        self.board.do_move(0)
+
+        state = self.board.current_state()
+
+        self.assertEqual(state.dtype, np.float32)
 
 if __name__ == '__main__':
     unittest.main()

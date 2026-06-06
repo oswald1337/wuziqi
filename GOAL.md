@@ -63,6 +63,125 @@ Preferred first trial:
 .venv/bin/python main.py --mode improve --presets large_16x16_top_human_gpu --rounds 1 --eval-games 32 --previous-best-games 32
 ```
 
+Completed MVP result on 2026-06-06:
+
+- Final checkpoint: `large_16x16_top_human_gpu_final_g524_20260606_014356_758050`.
+- Self-play: 512/512 games, 35,388 moves, 0 draws, 0 illegal/runtime eval failures.
+- Throughput: about 3.24 self-play moves/sec and 2.80 search moves/sec over
+  the parallel stream.
+- Efficiency diagnosis: self-play was MCTS/search-coordination-bound. GPU
+  inference batching worked, but utilization came in bursts; CPU use stayed far
+  below all-core saturation. External evaluation was serial CPU-bound and much
+  slower than expected.
+- Built-in final eval: Elo 454, 32/32 vs random, 3.125% vs heuristic.
+- Promotion eval: Elo 684, 21.875% vs heuristic, 9.375% vs previous best; no
+  promotion.
+- Replay inspection is now reproducible with `replay_audit.py`. The 50k-sample
+  MVP replay tail classified as `diffuse_policy_targets`: value labels were
+  balanced and draw-free, 84.0% of policy targets had max probability <= 0.02,
+  only 13.8% had max probability >= 0.25, and normalized policy entropy
+  averaged 0.795.
+- Replay target rewrites can now be probed without training by adding
+  `--probe-transforms` to `replay_audit.py`; the probe compares power, top-k,
+  min-prob, top-k+power, and top-1 targets by retained MCTS mass, support size,
+  top-1 agreement, max-prob/entropy deltas, and distortion metrics.
+- The top-human GPU preset now applies the focused self-play target rewrite
+  selected from that probe: `self_play_target_transform=top_k` with
+  `self_play_target_top_k=16`. The 50k replay probe showed this raises mean
+  policy max probability from about 0.147 to 0.207, drops normalized entropy
+  by about 0.366, preserves the search top move, and retains about 24.8% of
+  original MCTS target mass before renormalization.
+- Decision: do not continue this recipe longer. Improve evaluation/search
+  efficiency and target sharpness/alignment before another long run.
+- Integrated audit decision:
+  `decision_recommendation.label=fix_search_target_alignment_before_scaling`.
+
+Before the next remote training run:
+
+- Keep the draw-penalty champion as the seed unless a stricter promotion probe
+  replaces it.
+- Use the parallel external evaluator added after the MVP (`eval_parallel_games`
+  in the preset and repaired checkpoint metadata) so previous-best checks do
+  not run as one-core CPU jobs.
+- Do not rerun `large_16x16_top_human_gpu` unchanged. The next recipe should
+  change search/target alignment, such as filtering or sharpening MCTS policy
+  targets, improving root target quality, or reducing duplicate serial eval.
+- Preserve TensorBoard/JSONL instrumentation, especially eval scores, replay
+  samples, target entropy/sharpness if added, and runtime timings.
+- Verify required TensorBoard scalar coverage with `tensorboard_audit.py`
+  after each long run.
+- Before a long run, check the monitor/CUDA/parallel-worker stack with
+  `remote_health_check.py --preset large_16x16_top_human_gpu --eval-games 32`.
+- After each long run, summarize the exact JSONL run slice with
+  `training_audit.py --gpu-log gpu_smi.log --resource-log resource_monitor.jsonl --replay-path checkpoints/replay_16x16_n5_r4_f64.pkl`
+  instead of mixing aborted attempts with the completed checkpoint run.
+  The audit's `bottleneck_assessment` is the source of truth for deciding
+  whether the next change should target GPU batching, CPU utilization, or MCTS
+  search coordination, and `replay_quality` is the source of truth for target
+  sharpness/value-label quality.
+- Before changing the search target recipe, summarize replay quality with
+  `replay_audit.py checkpoints/replay_16x16_n5_r4_f64.pkl --max-samples 50000 --strategy tail`.
+  If the audit again reports diffuse policy targets, fix target sharpness or
+  search alignment before scaling.
+- Before changing the target rewrite again, run the same audit with
+  `--probe-transforms` and choose from transform evidence rather than adding
+  another heuristic by guesswork.
+- The current chosen rewrite is top-k-16 self-play target sharpening. Do not
+  add more target heuristics before evaluating whether this improves target
+  entropy and fixed-baseline scores with the existing efficiency instrumentation.
+- New runs also emit self-play target-quality scalars directly, including
+  `self_play/policy_target_diffuse_fraction`,
+  `self_play/policy_target_normalized_entropy_mean`, and
+  `self_play/value_target_draw_fraction`.
+- For future remote runs, start `resource_monitor.py` in tmux so CPU load,
+  cgroup CPU-quota utilization, memory, and GPU utilization are sampled as
+  JSONL. Treat `cpu_util_percent` as the training container's CPU usage and
+  `host_cpu_util_percent` as ambient host-wide pressure. The monitor also
+  mirrors those resource scalars into
+  `checkpoints/tensorboard/resource_monitor` by default.
+  The current resource monitor started after the 2026-06-06 MVP run, so that
+  completed run still uses `gpu_smi.log` plus training JSONL as its resource
+  evidence; future runs should compare in-run CPU samples against the idle
+  baseline from `resource_monitor.jsonl`.
+- The `large_16x16_top_human_gpu` preset now uses auto self-play/eval
+  parallelism capped to the usable cgroup CPU worker count. On the current
+  remote GPU box, the visible CPU count is 72 but the cgroup quota is 11.52
+  cores, so auto resolves to 12 workers unless explicitly overridden.
+
+Final server wrap on 2026-06-06 before the rented GPU expired:
+
+- Final health check passed: PyTorch CUDA saw one NVIDIA GeForce RTX 4060,
+  `nvidia-smi` was available, TensorBoard HTTP returned 200, and the required
+  training/resource TensorBoard scalar tags were present.
+- No training process was still active at wrap time; GPU memory was 0 MiB used
+  and utilization was 0%. The active tmux services were monitors plus
+  TensorBoard/web.
+- The final compact-request smoke checkpoint was
+  `large_16x16_top_human_gpu_final_g24_20260606_171202_292769`, not promoted
+  and not a new seed. Its purpose was to validate instrumentation and IPC
+  changes after the MVP run.
+- The compact-request smoke produced 12 self-play games, 915 moves, and about
+  6.37 self-play moves/sec. JSONL/TensorBoard recorded zero draw self-play,
+  zero invalid replay samples, and small loss decreases over the smoke
+  (`loss` -0.281, `policy_loss` -0.234, `value_loss` -0.047).
+- Runtime evidence from that smoke still points to search coordination/MCTS as
+  the bottleneck: stream elapsed was 143.7s, worker search-time sum was
+  1245.3s, worker wait was 57.9s, training was 8.3s, eval was 20.6s,
+  checkpointing was 8.9s, replay save was 5.5s, and total JSONL/TensorBoard
+  logging was below 1s.
+- Compact response and compact request protocols are now enabled by default in
+  the top-human GPU preset. Request state tensors are sent as `uint8`, reducing
+  request state payloads to 1024 bytes/position on 16x16 boards; compact
+  responses send flat probability/value arrays.
+- Compact IPC reduced request/response overhead but did not fully solve
+  utilization. The next efficiency work should target MCTS request cadence,
+  coalescing, and batched inference/search scheduling before adding more
+  tactical heuristics.
+- The remote artifacts under `checkpoints/` were about 1.9 GB and remain
+  ignored by git. To continue exact training state elsewhere, back up or
+  restore the seed checkpoint, optimizer, registry, replay pickle, JSONL, and
+  TensorBoard directory outside the source-code push.
+
 If the first GPU run is too slow or bottlenecked by CPU-side MCTS, do not start
 five more variants. Profile first, then change the bottleneck.
 
@@ -112,13 +231,14 @@ JSONL remains the source-of-truth event log:
 TensorBoard is the default readable chart backend:
 
 ```bash
-.venv/bin/tensorboard --logdir checkpoints/tensorboard --host 0.0.0.0 --port 8080
+.venv/bin/tensorboard --logdir checkpoints/tensorboard --host 0.0.0.0 --port 8081
 ```
 
-The local tunnel for viewing TensorBoard is:
+The MVP remote TensorBoard session currently listens on port 8081. The local
+tunnel for viewing it is:
 
 ```bash
-TERM=xterm-256color ssh -i ~/.ssh/vast -p 59644 root@74.48.140.178 -L 8080:localhost:8080
+TERM=xterm-256color ssh -i ~/.ssh/vast -p 59644 root@74.48.140.178 -L 8080:localhost:8081
 ```
 
 TensorBoard should show at least:
@@ -144,7 +264,7 @@ train seconds, evaluation seconds, and GPU memory/utilization when available.
 Server connection:
 
 ```bash
-TERM=xterm-256color ssh -i ~/.ssh/vast -p 59644 root@74.48.140.178 -L 8080:localhost:8080
+TERM=xterm-256color ssh -i ~/.ssh/vast -p 59644 root@74.48.140.178 -L 8080:localhost:8081
 ```
 
 Remote setup should:
@@ -154,7 +274,7 @@ Remote setup should:
    useful replay artifacts.
 3. Verify CUDA availability with PyTorch and `nvidia-smi`.
 4. Run tests or a quick import/compile check.
-5. Start TensorBoard on port 8080.
+5. Start TensorBoard on remote port 8081 and forward it to local port 8080.
 6. Start the MVP run in a persistent session such as `tmux`.
 7. Keep logs in `train.log`, `checkpoints/training_log.jsonl`, and
    `checkpoints/tensorboard`.

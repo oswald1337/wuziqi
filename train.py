@@ -3,9 +3,19 @@ import copy
 import json
 import time
 import os
+
+for _thread_env in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env, "1")
+
 import torch
 import random
 import pickle
+import traceback
 import numpy as np
 import multiprocessing as mp
 from collections import deque
@@ -15,6 +25,12 @@ from config import get_training_preset
 from game import Board, Game
 from mcts import MCTS, MCTSPlayer
 from model import PolicyValueNet
+from replay_audit import (
+    build_transform_spec,
+    summarize_replay_samples,
+    transform_policy_target,
+)
+from resource_monitor import usable_cpu_count
 from checkpoint_registry import (
     DEFAULT_REGISTRY_PATH,
     best_compatible_model_checkpoint,
@@ -497,6 +513,7 @@ def _train_step_from_buffer(
     priority_buffer=None,
     priority_fraction=None,
 ):
+    train_start = time.perf_counter()
     batch_size = min(config["batch_size"], len(data_buffer))
     mini_batch, priority_samples = _sample_training_batch(
         data_buffer,
@@ -531,13 +548,22 @@ def _train_step_from_buffer(
                 else value_loss_weight
             ),
         )
-    return {
+    metrics = {
         "loss": loss,
         "entropy": entropy,
         "batch_size": batch_size,
         "priority_samples": priority_samples,
+        "train_duration_s": time.perf_counter() - train_start,
         **getattr(policy_value_net, "last_train_components", {}),
     }
+    if torch.cuda.is_available():
+        device_index = torch.cuda.current_device()
+        metrics.update({
+            "gpu_memory_allocated_mb": torch.cuda.memory_allocated(device_index) / 1024 / 1024,
+            "gpu_memory_reserved_mb": torch.cuda.memory_reserved(device_index) / 1024 / 1024,
+            "gpu_max_memory_allocated_mb": torch.cuda.max_memory_allocated(device_index) / 1024 / 1024,
+        })
+    return metrics
 
 
 def _sample_training_batch(
@@ -670,6 +696,10 @@ TRAIN_METRIC_KEYS = (
     "policy_loss_weight",
     "value_loss_weight",
     "priority_samples",
+    "train_duration_s",
+    "gpu_memory_allocated_mb",
+    "gpu_memory_reserved_mb",
+    "gpu_max_memory_allocated_mb",
 )
 
 
@@ -692,25 +722,49 @@ def _new_board(config):
 
 
 def _evaluate_policy(policy_value_net, config):
+    eval_games = int(config.get("internal_eval_games", config["eval_games"]) or 0)
+    if eval_games <= 0:
+        return {
+            "skipped": True,
+            "reason": "internal final eval disabled; external evaluator is source of truth",
+            "games": 0,
+        }, 1000
+
     results = {}
     opponents = [
         ("random", 800, lambda: RandomPlayer()),
         ("heuristic", 1000, lambda: HeuristicPlayer()),
     ]
+    mcts_heuristic_prior_weight = config.get("mcts_heuristic_prior_weight")
+
+    def mcts_policy_fn(board):
+        return policy_value_net.policy_value_fn(
+            board,
+            heuristic_prior_weight=mcts_heuristic_prior_weight,
+        )
+
+    def mcts_policy_batch_fn(boards):
+        return policy_value_net.policy_value_batch_fn(
+            boards,
+            heuristic_prior_weight=mcts_heuristic_prior_weight,
+    )
 
     for opponent_id, opponent_elo, opponent_factory in opponents:
         wins = 0
         draws = 0
         losses = 0
-        for game_idx in range(config["eval_games"]):
+        for game_idx in range(eval_games):
             board = _new_board(config)
             game = Game(board)
             model_player = MCTSPlayer(
-                policy_value_net.policy_value_fn,
+                mcts_policy_fn,
                 c_puct=config["c_puct"],
                 n_playout=config["eval_n_playout"],
                 is_selfplay=0,
                 use_parallel=False,
+                policy_value_batch_function=mcts_policy_batch_fn,
+                mcts_batch_size=config.get("mcts_batch_size", 1),
+                mcts_min_batches_per_search=config.get("mcts_min_batches_per_search", 1),
                 tactical_threshold=config.get("mcts_tactical_threshold"),
                 two_ply_threats=config.get("mcts_two_ply_threats", False),
                 two_ply_max_candidates=config.get("mcts_two_ply_max_candidates", 16),
@@ -752,7 +806,7 @@ def _evaluate_policy(policy_value_net, config):
             "wins": wins,
             "draws": draws,
             "losses": losses,
-            "games": config["eval_games"],
+            "games": eval_games,
             "score": score,
         }
 
@@ -1009,12 +1063,29 @@ class TacticalBeamSelfPlayPlayer:
 def _new_self_play_player(policy_value_net, config, seed):
     mode = config.get("self_play_mode", "mcts")
     if mode == "mcts":
+        mcts_heuristic_prior_weight = config.get("mcts_heuristic_prior_weight")
+
+        def mcts_policy_fn(board):
+            return policy_value_net.policy_value_fn(
+                board,
+                heuristic_prior_weight=mcts_heuristic_prior_weight,
+            )
+
+        def mcts_policy_batch_fn(boards):
+            return policy_value_net.policy_value_batch_fn(
+                boards,
+                heuristic_prior_weight=mcts_heuristic_prior_weight,
+            )
+
         return MCTSPlayer(
-            policy_value_net.policy_value_fn,
+            mcts_policy_fn,
             c_puct=config["c_puct"],
             n_playout=config["n_playout"],
             is_selfplay=1,
             use_parallel=False,
+            policy_value_batch_function=mcts_policy_batch_fn,
+            mcts_batch_size=config.get("mcts_batch_size", 1),
+            mcts_min_batches_per_search=config.get("mcts_min_batches_per_search", 1),
             tactical_threshold=config.get("mcts_tactical_threshold"),
             two_ply_threats=config.get("mcts_two_ply_threats", False),
             two_ply_max_candidates=config.get("mcts_two_ply_max_candidates", 16),
@@ -1093,6 +1164,8 @@ def _self_play_stats(player, mode):
         stats["policy_moves"] = int(player.policy_moves)
     if hasattr(player, "search_moves"):
         stats["search_moves"] = int(player.search_moves)
+    if hasattr(player, "search_duration_s"):
+        stats["search_duration_s"] = float(player.search_duration_s)
     if hasattr(player, "dirichlet_noise_moves"):
         stats["dirichlet_noise_moves"] = int(player.dirichlet_noise_moves)
     if hasattr(player, "no_noise_moves"):
@@ -1110,6 +1183,12 @@ def _self_play_stats(player, mode):
     if hasattr(player, "tactical_leaf_reasons"):
         for reason, count in player.tactical_leaf_reasons.items():
             stats[f"tactical_leaf_{reason}"] = int(count)
+    if hasattr(player, "batched_policy_batches"):
+        stats["batched_policy_batches"] = int(player.batched_policy_batches)
+    if hasattr(player, "batched_policy_positions"):
+        stats["batched_policy_positions"] = int(player.batched_policy_positions)
+    if hasattr(player, "effective_mcts_batch_size"):
+        stats["effective_mcts_batch_size"] = int(player.effective_mcts_batch_size)
     if hasattr(player, "beam_moves"):
         stats["beam_moves"] = int(player.beam_moves)
     if hasattr(player, "fork_moves"):
@@ -1117,6 +1196,1231 @@ def _self_play_stats(player, mode):
     if hasattr(player, "candidate_evaluations"):
         stats["candidate_evaluations"] = int(player.candidate_evaluations)
     return stats
+
+
+_COMPACT_PREDICTION_REQUEST = "compact_v1"
+_COMPACT_PREDICTION_RESPONSE = "compact_v1"
+
+
+def _gpu_inference_state_dtype(value):
+    value = str(value or "uint8").strip().lower()
+    if value in {"uint8", "u8", "byte"}:
+        return np.uint8
+    if value in {"float32", "fp32", "f32"}:
+        return np.float32
+    raise ValueError(f"Unsupported gpu inference state dtype: {value!r}")
+
+
+def _pack_request_availables(request_availables):
+    lengths = np.asarray(
+        [len(actions) for actions in request_availables],
+        dtype=np.uint16,
+    )
+    total = int(np.sum(lengths)) if len(lengths) else 0
+    flat = np.empty(total, dtype=np.uint16)
+    offset = 0
+    for actions, length in zip(request_availables, lengths):
+        length = int(length)
+        if length <= 0:
+            continue
+        flat[offset:offset + length] = np.asarray(actions, dtype=np.uint16)
+        offset += length
+    return lengths, flat
+
+
+class _RemotePolicyValueNet:
+    """Policy proxy used by self-play workers; inference is served by parent."""
+
+    def __init__(
+        self,
+        conn,
+        compact_response=True,
+        compact_request=True,
+        state_dtype="uint8",
+    ):
+        self.conn = conn
+        self._request_id = 0
+        self.compact_response = bool(compact_response)
+        self.compact_request = bool(compact_request)
+        self.state_dtype = _gpu_inference_state_dtype(state_dtype)
+
+    def policy_value_fn(self, board, heuristic_prior_weight=None):
+        return self.policy_value_batch_fn(
+            [board],
+            heuristic_prior_weight=heuristic_prior_weight,
+        )[0]
+
+    def policy_value_batch_fn(self, boards, heuristic_prior_weight=None):
+        boards = list(boards)
+        self._request_id += 1
+        request_id = self._request_id
+        request_availables = [
+            [int(move) for move in board.availables]
+            for board in boards
+        ]
+        payload = {
+            "type": "predict_batch",
+            "request_id": request_id,
+            "heuristic_prior_weight": heuristic_prior_weight,
+        }
+        if self.compact_response:
+            payload["response_format"] = _COMPACT_PREDICTION_RESPONSE
+        if heuristic_prior_weight is not None and float(heuristic_prior_weight) > 0.0:
+            payload["boards"] = boards
+        else:
+            payload["states"] = np.ascontiguousarray(
+                [board.current_state() for board in boards],
+                dtype=self.state_dtype,
+            )
+            if self.compact_request:
+                lengths, flat_availables = _pack_request_availables(request_availables)
+                payload["request_format"] = _COMPACT_PREDICTION_REQUEST
+                payload["available_lengths"] = lengths
+                payload["flat_availables"] = flat_availables
+            else:
+                payload["availables"] = request_availables
+        self.conn.send(payload)
+        message = self.conn.recv()
+        if not isinstance(message, dict) or message.get("type") != "prediction_batch":
+            raise RuntimeError(f"Unexpected inference response: {message!r}")
+        if message.get("request_id") != request_id:
+            raise RuntimeError(
+                f"Mismatched inference response id {message.get('request_id')} "
+                f"for request {request_id}"
+            )
+        if message.get("response_format") == _COMPACT_PREDICTION_RESPONSE:
+            return self._decode_compact_response(message, request_availables)
+
+        results = []
+        for item in message.get("evaluations", []):
+            actions = [int(action) for action in item.get("actions", [])]
+            probs = [float(prob) for prob in item.get("probs", [])]
+            results.append((list(zip(actions, probs)), float(item.get("value", 0.0))))
+        return results
+
+    def _decode_compact_response(self, message, request_availables):
+        lengths = message.get("prob_lengths", [])
+        flat_probs = message.get("flat_probs", [])
+        values = message.get("values", [])
+        if len(lengths) != len(request_availables) or len(values) != len(request_availables):
+            raise RuntimeError(
+                "Compact inference response has mismatched lengths: "
+                f"{len(lengths)} prob lengths, {len(values)} values, "
+                f"{len(request_availables)} requests"
+            )
+
+        results = []
+        offset = 0
+        for actions, length, value in zip(request_availables, lengths, values):
+            length = int(length)
+            if length != len(actions):
+                raise RuntimeError(
+                    "Compact inference response legal-prob length mismatch: "
+                    f"{length} probabilities for {len(actions)} legal moves"
+                )
+            probs = flat_probs[offset:offset + length]
+            offset += length
+            results.append((
+                list(zip(actions, [float(prob) for prob in probs])),
+                float(value),
+            ))
+        if offset != len(flat_probs):
+            raise RuntimeError(
+                "Compact inference response has unused probabilities: "
+                f"used {offset} of {len(flat_probs)}"
+            )
+        return results
+
+
+def _parallel_self_play_worker(worker_id, conn, config):
+    """Play games in a child process while the parent serves neural inference."""
+    try:
+        try:
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+
+        remote_policy = _RemotePolicyValueNet(
+            conn,
+            compact_response=config.get("gpu_inference_compact_response", True),
+            compact_request=config.get("gpu_inference_compact_request", True),
+            state_dtype=config.get("gpu_inference_state_dtype", "uint8"),
+        )
+        while True:
+            command = conn.recv()
+            if not isinstance(command, dict):
+                continue
+            if command.get("type") == "stop":
+                break
+            if command.get("type") != "play":
+                raise RuntimeError(f"Unknown worker command: {command!r}")
+
+            game_idx = int(command["game_idx"])
+            game_seed = int(command["seed"])
+            random.seed(game_seed)
+            np.random.seed(game_seed)
+            torch.manual_seed(game_seed)
+
+            board = _new_board(config)
+            game = Game(board)
+            self_play_mode = config.get("self_play_mode", "mcts")
+            self_play_player = _new_self_play_player(
+                remote_policy,
+                config,
+                game_seed,
+            )
+            start = time.time()
+            winner, play_data, moves = game.start_self_play(
+                self_play_player,
+                is_shown=0,
+                temp=_self_play_temperature(config),
+            )
+            duration_s = time.time() - start
+            conn.send({
+                "type": "game_result",
+                "worker_id": worker_id,
+                "game_idx": game_idx,
+                "winner": int(winner),
+                "play_data": list(play_data),
+                "moves": list(moves),
+                "duration_s": duration_s,
+                "stats": _self_play_stats(self_play_player, self_play_mode),
+            })
+    except EOFError:
+        pass
+    except Exception:
+        try:
+            conn.send({
+                "type": "worker_error",
+                "worker_id": worker_id,
+                "traceback": traceback.format_exc(),
+            })
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _parallel_self_play_worker_count(config):
+    return _resolve_parallel_worker_count(
+        config,
+        key="self_play_parallel_games",
+        prefix="self_play",
+    )
+
+
+_AUTO_PARALLEL_VALUES = {"auto", "all", "all_cpus", "cpu", "cpus"}
+
+
+class _RuntimeBudget:
+    def __init__(self, max_runtime_minutes=None, dispatch_margin_minutes=None):
+        if max_runtime_minutes is None:
+            self.max_runtime_minutes = None
+            self.max_runtime_s = None
+        else:
+            max_runtime_minutes = float(max_runtime_minutes)
+            if max_runtime_minutes < 0:
+                raise ValueError("max_runtime_minutes must be non-negative")
+            self.max_runtime_minutes = max_runtime_minutes
+            self.max_runtime_s = max_runtime_minutes * 60.0
+        dispatch_margin_minutes = float(dispatch_margin_minutes or 0.0)
+        if dispatch_margin_minutes < 0:
+            raise ValueError("dispatch_margin_minutes must be non-negative")
+        self.dispatch_margin_minutes = dispatch_margin_minutes
+        self.dispatch_margin_s = dispatch_margin_minutes * 60.0
+        self.start_s = time.perf_counter()
+        self.triggered_at_s = None
+        self.dispatch_triggered_at_s = None
+
+    @property
+    def enabled(self):
+        return self.max_runtime_s is not None
+
+    def elapsed_s(self):
+        return time.perf_counter() - self.start_s
+
+    def expired(self):
+        if not self.enabled:
+            return False
+        elapsed = self.elapsed_s()
+        if elapsed >= self.max_runtime_s:
+            if self.triggered_at_s is None:
+                self.triggered_at_s = elapsed
+            return True
+        return False
+
+    def should_stop_dispatch(self, estimated_unit_s=0.0):
+        if not self.enabled:
+            return False
+        elapsed = self.elapsed_s()
+        estimated_unit_s = max(0.0, float(estimated_unit_s or 0.0))
+        projected_elapsed = elapsed + estimated_unit_s + self.dispatch_margin_s
+        if elapsed >= self.max_runtime_s:
+            if self.triggered_at_s is None:
+                self.triggered_at_s = elapsed
+            if self.dispatch_triggered_at_s is None:
+                self.dispatch_triggered_at_s = elapsed
+            return True
+        if projected_elapsed >= self.max_runtime_s:
+            if self.dispatch_triggered_at_s is None:
+                self.dispatch_triggered_at_s = elapsed
+            return True
+        return False
+
+    def summary(self):
+        elapsed = self.elapsed_s()
+        if not self.enabled:
+            return {
+                "max_runtime_minutes": None,
+                "max_runtime_s": None,
+                "runtime_dispatch_margin_minutes": round(self.dispatch_margin_minutes, 4),
+                "runtime_dispatch_margin_s": round(self.dispatch_margin_s, 3),
+                "runtime_elapsed_s": round(elapsed, 3),
+                "runtime_remaining_s": None,
+                "runtime_budget_exceeded": False,
+                "runtime_dispatch_stopped": False,
+            }
+        remaining = max(0.0, self.max_runtime_s - elapsed)
+        exceeded = self.triggered_at_s is not None or elapsed >= self.max_runtime_s
+        return {
+            "max_runtime_minutes": round(self.max_runtime_minutes, 4),
+            "max_runtime_s": round(self.max_runtime_s, 3),
+            "runtime_dispatch_margin_minutes": round(self.dispatch_margin_minutes, 4),
+            "runtime_dispatch_margin_s": round(self.dispatch_margin_s, 3),
+            "runtime_elapsed_s": round(elapsed, 3),
+            "runtime_remaining_s": round(remaining, 3),
+            "runtime_budget_exceeded": bool(exceeded),
+            "runtime_dispatch_stopped": self.dispatch_triggered_at_s is not None,
+        }
+
+
+def _requested_parallel_workers(value, default=1):
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in _AUTO_PARALLEL_VALUES:
+            return None
+    return max(1, int(value or default))
+
+
+def _resolve_parallel_worker_count(config, key, prefix, limit=None, default=1):
+    requested = _requested_parallel_workers(config.get(key, default), default=default)
+    multiplier = float(config.get(f"{prefix}_parallel_cpu_multiplier", 1.0) or 1.0)
+    cpu_cap = usable_cpu_count(multiplier=multiplier)
+    if requested is None:
+        resolved = cpu_cap
+    elif config.get(f"{prefix}_parallel_cap_to_cpu", True):
+        resolved = min(requested, cpu_cap)
+    else:
+        resolved = requested
+    if limit is not None:
+        resolved = min(resolved, int(limit))
+    return max(1, int(resolved))
+
+
+def _start_parallel_self_play_workers(config, logger):
+    worker_count = _parallel_self_play_worker_count(config)
+    if worker_count <= 1:
+        return [], []
+
+    ctx = mp.get_context("spawn")
+    workers = []
+    pipes = []
+    for worker_id in range(worker_count):
+        parent_conn, child_conn = ctx.Pipe()
+        process = ctx.Process(
+            target=_parallel_self_play_worker,
+            args=(worker_id, child_conn, dict(config)),
+            daemon=True,
+        )
+        process.start()
+        child_conn.close()
+        workers.append(process)
+        pipes.append(parent_conn)
+
+    logger.info(
+        "Started %s parallel self-play workers (requested=%r usable_cpu_workers=%s cpu_count=%s)",
+        worker_count,
+        config.get("self_play_parallel_games", 1),
+        usable_cpu_count(
+            multiplier=float(config.get("self_play_parallel_cpu_multiplier", 1.0) or 1.0),
+        ),
+        os.cpu_count(),
+    )
+    return workers, pipes
+
+
+def _stop_parallel_self_play_workers(workers, pipes, logger):
+    for pipe in pipes:
+        try:
+            pipe.send({"type": "stop"})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+    for process in workers:
+        process.join(timeout=5)
+        if process.is_alive():
+            logger.warning("Terminating stuck self-play worker pid=%s", process.pid)
+            process.terminate()
+            process.join(timeout=5)
+
+    for pipe in pipes:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _legal_policy_probs_array_from_availables(
+    act_probs,
+    availables,
+    dtype=np.float64,
+):
+    legal_positions = [int(move) for move in availables]
+    if not legal_positions:
+        return legal_positions, np.asarray([], dtype=dtype)
+    legal_probs = np.asarray(act_probs, dtype=np.float64)[legal_positions]
+    legal_probs[~np.isfinite(legal_probs)] = 0.0
+    legal_probs = np.maximum(legal_probs, 0.0)
+    legal_probs_sum = float(np.sum(legal_probs))
+    if legal_probs_sum <= 0.0:
+        legal_probs = np.full(len(legal_positions), 1.0 / len(legal_positions))
+    else:
+        legal_probs = legal_probs / legal_probs_sum
+    return legal_positions, legal_probs.astype(dtype, copy=False)
+
+
+def _legal_policy_probs_from_availables(act_probs, availables):
+    legal_positions, legal_probs = _legal_policy_probs_array_from_availables(
+        act_probs,
+        availables,
+        dtype=np.float64,
+    )
+    return legal_positions, [float(prob) for prob in legal_probs]
+
+
+def _decode_request_availables(message, state_count):
+    if message.get("request_format") == _COMPACT_PREDICTION_REQUEST:
+        lengths = np.asarray(message.get("available_lengths", []), dtype=np.int64)
+        flat = np.asarray(message.get("flat_availables", []), dtype=np.uint16)
+        if len(lengths) != state_count:
+            raise RuntimeError(
+                "Compact prediction request has mismatched states/lengths: "
+                f"{state_count} states vs {len(lengths)} legal lengths"
+            )
+        total = int(np.sum(lengths)) if len(lengths) else 0
+        if total != len(flat):
+            raise RuntimeError(
+                "Compact prediction request has mismatched legal payload: "
+                f"{total} expected values vs {len(flat)} flat legal moves"
+            )
+        availables = []
+        offset = 0
+        for length in lengths:
+            length = int(length)
+            availables.append(flat[offset:offset + length])
+            offset += length
+        return availables, total
+
+    availables = list(message.get("availables", []))
+    if len(availables) != state_count:
+        raise RuntimeError(
+            "Prediction request has mismatched states/availables: "
+            f"{state_count} states vs {len(availables)} legal lists"
+        )
+    return availables, sum(len(actions) for actions in availables)
+
+
+def _evaluate_remote_policy_payloads(policy_value_net, payloads, config):
+    max_batch_size = int(config.get("gpu_inference_max_batch_size", 0) or len(payloads) or 1)
+    max_batch_size = max(1, max_batch_size)
+    evaluations = []
+    batches = 0
+
+    if payloads and all("states" in item for item in payloads):
+        state_batches = []
+        availables_batch = []
+        response_formats = []
+        for item in payloads:
+            states = np.ascontiguousarray(
+                item.get("states", []),
+                dtype=np.float32,
+            )
+            legal_lists = list(item.get("availables_batch", []))
+            if len(states) != len(legal_lists):
+                raise RuntimeError(
+                    "Prediction payload has mismatched states/availables: "
+                    f"{len(states)} states vs {len(legal_lists)} legal lists"
+                )
+            if len(states) == 0:
+                continue
+            state_batches.append(states)
+            availables_batch.extend(legal_lists)
+            response_formats.extend([item.get("response_format")] * len(states))
+
+        if not state_batches:
+            return [], 0
+        if len(state_batches) == 1:
+            states = state_batches[0]
+        else:
+            states = np.ascontiguousarray(
+                np.concatenate(state_batches, axis=0),
+                dtype=np.float32,
+            )
+
+        for start in range(0, len(states), max_batch_size):
+            end = min(len(states), start + max_batch_size)
+            act_probs_batch, values = policy_value_net.policy_value(states[start:end])
+            batches += 1
+            for idx, legal_moves in enumerate(availables_batch[start:end]):
+                global_idx = start + idx
+                compact = response_formats[global_idx] == _COMPACT_PREDICTION_RESPONSE
+                legal_positions, legal_probs = _legal_policy_probs_array_from_availables(
+                    act_probs_batch[idx],
+                    legal_moves,
+                    dtype=np.float32 if compact else np.float64,
+                )
+                if compact:
+                    evaluations.append({
+                        "probs": legal_probs,
+                        "value": float(values[idx][0]),
+                    })
+                else:
+                    evaluations.append({
+                        "actions": legal_positions,
+                        "probs": [float(prob) for prob in legal_probs],
+                        "value": float(values[idx][0]),
+                    })
+        return evaluations, batches
+
+    expanded_payloads = []
+    for item in payloads:
+        if "board" in item:
+            expanded_payloads.append(item)
+            continue
+        if "boards" in item:
+            for board in item.get("boards", []):
+                expanded_payloads.append({
+                    "board": board,
+                    "heuristic_prior_weight": item.get("heuristic_prior_weight"),
+                    "response_format": item.get("response_format"),
+                })
+            continue
+        if "states" in item:
+            states = np.ascontiguousarray(
+                item.get("states", []),
+                dtype=np.float32,
+            )
+            legal_lists = list(item.get("availables_batch", []))
+            if len(states) != len(legal_lists):
+                raise RuntimeError(
+                    "Prediction payload has mismatched states/availables: "
+                    f"{len(states)} states vs {len(legal_lists)} legal lists"
+                )
+            for state, legal_moves in zip(states, legal_lists):
+                expanded_payloads.append({
+                    "state": state,
+                    "availables": legal_moves,
+                    "response_format": item.get("response_format"),
+                })
+            continue
+        expanded_payloads.append(item)
+
+    for start in range(0, len(expanded_payloads), max_batch_size):
+        chunk_payloads = expanded_payloads[start:start + max_batch_size]
+        states = np.ascontiguousarray([
+            item["state"] if "state" in item else item["board"].current_state()
+            for item in chunk_payloads
+        ])
+        act_probs_batch, values = policy_value_net.policy_value(states)
+        batches += 1
+        for idx, item in enumerate(chunk_payloads):
+            compact = item.get("response_format") == _COMPACT_PREDICTION_RESPONSE
+            if "board" in item:
+                board = item["board"]
+                legal_positions = [int(move) for move in board.availables]
+                legal_probs = policy_value_net._legal_policy_probs(
+                    board,
+                    act_probs_batch[idx],
+                    heuristic_prior_weight=item.get("heuristic_prior_weight"),
+                )
+                legal_probs = np.asarray(
+                    legal_probs,
+                    dtype=np.float32 if compact else np.float64,
+                )
+            else:
+                legal_positions, legal_probs = _legal_policy_probs_array_from_availables(
+                    act_probs_batch[idx],
+                    item.get("availables", []),
+                    dtype=np.float32 if compact else np.float64,
+                )
+            if compact:
+                evaluations.append({
+                    "probs": legal_probs,
+                    "value": float(values[idx][0]),
+                })
+            else:
+                evaluations.append({
+                    "actions": legal_positions,
+                    "probs": [float(prob) for prob in legal_probs],
+                    "value": float(values[idx][0]),
+                })
+    return evaluations, batches
+
+
+def _compact_prediction_response(request_id, evaluations):
+    lengths = np.asarray(
+        [len(item.get("probs", [])) for item in evaluations],
+        dtype=np.int32,
+    )
+    values = np.asarray(
+        [float(item.get("value", 0.0)) for item in evaluations],
+        dtype=np.float32,
+    )
+    total_probs = int(np.sum(lengths)) if len(lengths) else 0
+    flat_probs = np.empty(total_probs, dtype=np.float32)
+    offset = 0
+    for item, length in zip(evaluations, lengths):
+        length = int(length)
+        if length <= 0:
+            continue
+        probs = np.asarray(item.get("probs", []), dtype=np.float32)
+        flat_probs[offset:offset + length] = probs
+        offset += length
+    return {
+        "type": "prediction_batch",
+        "request_id": request_id,
+        "response_format": _COMPACT_PREDICTION_RESPONSE,
+        "prob_lengths": lengths,
+        "flat_probs": flat_probs,
+        "values": values,
+    }, total_probs
+
+
+def _send_prediction_responses(pending_requests, evaluations, metrics):
+    response_send_start = time.perf_counter()
+    for pipe, request_id, start, count, response_format in pending_requests:
+        request_evaluations = evaluations[start:start + count]
+        build_start = time.perf_counter()
+        if response_format == _COMPACT_PREDICTION_RESPONSE:
+            response, probability_values = _compact_prediction_response(
+                request_id,
+                request_evaluations,
+            )
+            metrics["parallel_compact_responses"] += 1
+        else:
+            probability_values = sum(
+                len(item.get("probs", []))
+                for item in request_evaluations
+            )
+            response = {
+                "type": "prediction_batch",
+                "request_id": request_id,
+                "evaluations": request_evaluations,
+            }
+        metrics["parallel_response_probability_values"] += int(probability_values)
+        metrics["parallel_response_build_duration_s"] += (
+            time.perf_counter() - build_start
+        )
+
+        pipe_send_start = time.perf_counter()
+        pipe.send(response)
+        metrics["parallel_response_pipe_send_duration_s"] += (
+            time.perf_counter() - pipe_send_start
+        )
+    metrics["parallel_response_send_duration_s"] += (
+        time.perf_counter() - response_send_start
+    )
+
+
+def _new_parallel_metrics(worker_count=0):
+    return {
+        "parallel_workers": int(worker_count),
+        "parallel_batch_games": 0,
+        "gpu_inference_requests": 0,
+        "gpu_inference_batches": 0,
+        "gpu_inference_positions": 0,
+        "gpu_inference_duration_s": 0.0,
+        "parallel_wait_duration_s": 0.0,
+        "parallel_wait_calls": 0,
+        "parallel_ready_events": 0,
+        "parallel_ready_pipes": 0,
+        "parallel_messages": 0,
+        "parallel_predict_messages": 0,
+        "parallel_game_result_messages": 0,
+        "parallel_coalesce_duration_s": 0.0,
+        "parallel_coalesce_calls": 0,
+        "parallel_coalesce_wait_calls": 0,
+        "parallel_coalesce_extra_pipes": 0,
+        "parallel_coalesce_empty_waits": 0,
+        "parallel_payload_build_duration_s": 0.0,
+        "parallel_request_state_bytes": 0,
+        "parallel_request_available_values": 0,
+        "parallel_compact_requests": 0,
+        "parallel_response_send_duration_s": 0.0,
+        "parallel_response_build_duration_s": 0.0,
+        "parallel_response_pipe_send_duration_s": 0.0,
+        "parallel_response_probability_values": 0,
+        "parallel_compact_responses": 0,
+    }
+
+
+def _finish_parallel_metrics(metrics, duration_s):
+    metrics = dict(metrics)
+    duration_s = max(0.0, float(duration_s))
+    metrics["parallel_batch_duration_s"] = duration_s
+    if metrics.get("gpu_inference_batches"):
+        metrics["gpu_inference_positions_per_batch"] = (
+            metrics["gpu_inference_positions"] / metrics["gpu_inference_batches"]
+        )
+    if metrics.get("gpu_inference_requests"):
+        metrics["gpu_inference_positions_per_request"] = (
+            metrics["gpu_inference_positions"] / metrics["gpu_inference_requests"]
+        )
+        metrics["gpu_inference_batches_per_request"] = (
+            metrics["gpu_inference_batches"] / metrics["gpu_inference_requests"]
+        )
+    if metrics.get("gpu_inference_duration_s", 0.0) > 0:
+        metrics["gpu_inference_positions_per_second"] = (
+            metrics["gpu_inference_positions"] / metrics["gpu_inference_duration_s"]
+        )
+    if metrics.get("parallel_wait_calls"):
+        metrics["parallel_wait_seconds_per_call"] = (
+            metrics["parallel_wait_duration_s"] / metrics["parallel_wait_calls"]
+        )
+    if metrics.get("parallel_ready_events"):
+        metrics["parallel_ready_pipes_per_event"] = (
+            metrics["parallel_ready_pipes"] / metrics["parallel_ready_events"]
+        )
+    if metrics.get("parallel_coalesce_calls"):
+        metrics["parallel_coalesce_extra_pipes_per_call"] = (
+            metrics["parallel_coalesce_extra_pipes"] / metrics["parallel_coalesce_calls"]
+        )
+    if metrics.get("parallel_coalesce_wait_calls"):
+        metrics["parallel_coalesce_empty_wait_fraction"] = (
+            metrics["parallel_coalesce_empty_waits"]
+            / metrics["parallel_coalesce_wait_calls"]
+        )
+    if metrics.get("gpu_inference_requests"):
+        metrics["parallel_compact_request_fraction"] = (
+            metrics.get("parallel_compact_requests", 0)
+            / metrics["gpu_inference_requests"]
+        )
+        metrics["parallel_compact_response_fraction"] = (
+            metrics.get("parallel_compact_responses", 0)
+            / metrics["gpu_inference_requests"]
+        )
+        metrics["parallel_response_probability_values_per_request"] = (
+            metrics.get("parallel_response_probability_values", 0)
+            / metrics["gpu_inference_requests"]
+        )
+    if metrics.get("gpu_inference_positions"):
+        metrics["parallel_request_state_bytes_per_position"] = (
+            metrics.get("parallel_request_state_bytes", 0)
+            / metrics["gpu_inference_positions"]
+        )
+        metrics["parallel_request_available_values_per_position"] = (
+            metrics.get("parallel_request_available_values", 0)
+            / metrics["gpu_inference_positions"]
+        )
+    if duration_s > 0:
+        metrics["parallel_coalesce_fraction"] = (
+            metrics.get("parallel_coalesce_duration_s", 0.0) / duration_s
+        )
+        metrics["parallel_payload_build_fraction"] = (
+            metrics.get("parallel_payload_build_duration_s", 0.0) / duration_s
+        )
+        metrics["parallel_response_send_fraction"] = (
+            metrics.get("parallel_response_send_duration_s", 0.0) / duration_s
+        )
+        metrics["parallel_response_build_fraction"] = (
+            metrics.get("parallel_response_build_duration_s", 0.0) / duration_s
+        )
+        metrics["parallel_response_pipe_send_fraction"] = (
+            metrics.get("parallel_response_pipe_send_duration_s", 0.0) / duration_s
+        )
+    if duration_s > 0:
+        metrics["parallel_games_per_second"] = (
+            metrics.get("parallel_batch_games", 0) / duration_s
+        )
+    return metrics
+
+
+def _coalesce_ready_pipes(active_pipes, ready_pipes, max_wait_s, wait_slice_s=None):
+    ready_pipes = list(ready_pipes)
+    if max_wait_s <= 0.0 or len(ready_pipes) >= len(active_pipes):
+        return ready_pipes, {
+            "duration_s": 0.0,
+            "calls": 0,
+            "wait_calls": 0,
+            "extra_pipes": 0,
+            "empty_waits": 0,
+        }
+
+    coalesce_start = time.perf_counter()
+    seen_ready = set(ready_pipes)
+    deadline = time.perf_counter() + max_wait_s
+    wait_slice_s = float(wait_slice_s or max_wait_s)
+    if wait_slice_s <= 0.0:
+        wait_slice_s = max_wait_s
+
+    metrics = {
+        "calls": 1,
+        "wait_calls": 0,
+        "extra_pipes": 0,
+        "empty_waits": 0,
+    }
+    while len(seen_ready) < len(active_pipes):
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0.0:
+            break
+        remaining_pipes = [
+            pipe for pipe in active_pipes
+            if pipe not in seen_ready
+        ]
+        timeout = min(remaining, wait_slice_s)
+        metrics["wait_calls"] += 1
+        extra_ready = mp.connection.wait(remaining_pipes, timeout=timeout)
+        new_ready = [pipe for pipe in extra_ready if pipe not in seen_ready]
+        if not new_ready:
+            metrics["empty_waits"] += 1
+            if wait_slice_s < max_wait_s:
+                break
+            continue
+        ready_pipes.extend(new_ready)
+        seen_ready.update(new_ready)
+        metrics["extra_pipes"] += len(new_ready)
+
+    metrics["duration_s"] = time.perf_counter() - coalesce_start
+    return ready_pipes, metrics
+
+
+def _serve_parallel_self_play_batch(
+    policy_value_net,
+    config,
+    seed,
+    game_indices,
+    workers,
+    pipes,
+    logger,
+):
+    assigned = list(zip(game_indices, workers[:len(game_indices)], pipes[:len(game_indices)]))
+    if not assigned:
+        return {}, {}
+
+    batch_start = time.perf_counter()
+    for game_idx, _process, pipe in assigned:
+        pipe.send({
+            "type": "play",
+            "game_idx": int(game_idx),
+            "seed": int(seed + 30_000 + game_idx),
+        })
+
+    active_pipes = [pipe for _game_idx, _process, pipe in assigned]
+    pipe_to_process = {pipe: process for _game_idx, process, pipe in assigned}
+    results = {}
+    metrics = _new_parallel_metrics(worker_count=len(assigned))
+    metrics["parallel_batch_games"] = len(assigned)
+
+    while len(results) < len(assigned):
+        wait_start = time.perf_counter()
+        metrics["parallel_wait_calls"] += 1
+        ready_pipes = mp.connection.wait(active_pipes, timeout=1.0)
+        metrics["parallel_wait_duration_s"] += time.perf_counter() - wait_start
+        if not ready_pipes:
+            dead = [
+                process
+                for process in pipe_to_process.values()
+                if process.exitcode is not None and process.exitcode != 0
+            ]
+            if dead:
+                raise RuntimeError(
+                    "Parallel self-play worker exited early: "
+                    + ", ".join(str(process.pid) for process in dead)
+                )
+            continue
+
+        coalesce_s = max(
+            0.0,
+            float(config.get("gpu_inference_coalesce_ms", 0.0) or 0.0) / 1000.0,
+        )
+        coalesce_slice_s = max(
+            0.0,
+            float(config.get("gpu_inference_coalesce_slice_ms", 0.0) or 0.0)
+            / 1000.0,
+        )
+        ready_pipes, coalesce_metrics = _coalesce_ready_pipes(
+            active_pipes,
+            ready_pipes,
+            coalesce_s,
+            wait_slice_s=coalesce_slice_s,
+        )
+        metrics["parallel_coalesce_duration_s"] += coalesce_metrics["duration_s"]
+        metrics["parallel_coalesce_calls"] += coalesce_metrics["calls"]
+        metrics["parallel_coalesce_wait_calls"] += coalesce_metrics["wait_calls"]
+        metrics["parallel_coalesce_extra_pipes"] += coalesce_metrics["extra_pipes"]
+        metrics["parallel_coalesce_empty_waits"] += coalesce_metrics["empty_waits"]
+
+        pending_requests = []
+        inference_payloads = []
+        payload_positions = 0
+        payload_build_start = time.perf_counter()
+        metrics["parallel_ready_events"] += 1
+        metrics["parallel_ready_pipes"] += len(ready_pipes)
+        for pipe in ready_pipes:
+            try:
+                message = pipe.recv()
+            except EOFError as exc:
+                process = pipe_to_process.get(pipe)
+                raise RuntimeError(
+                    f"Parallel self-play worker pipe closed pid={getattr(process, 'pid', None)}"
+                ) from exc
+
+            if not isinstance(message, dict):
+                raise RuntimeError(f"Unexpected worker message: {message!r}")
+
+            metrics["parallel_messages"] += 1
+            message_type = message.get("type")
+            if message_type == "game_result":
+                metrics["parallel_game_result_messages"] += 1
+                results[int(message["game_idx"])] = message
+                continue
+            if message_type == "worker_error":
+                raise RuntimeError(
+                    f"Parallel self-play worker {message.get('worker_id')} failed:\n"
+                    f"{message.get('traceback')}"
+                )
+            if message_type != "predict_batch":
+                raise RuntimeError(f"Unexpected worker message type: {message_type!r}")
+            metrics["parallel_predict_messages"] += 1
+
+            start = payload_positions
+            heuristic_weight = message.get("heuristic_prior_weight")
+            response_format = message.get("response_format")
+            boards = list(message.get("boards", []))
+            if boards:
+                inference_payloads.append({
+                    "boards": boards,
+                    "heuristic_prior_weight": heuristic_weight,
+                    "response_format": response_format,
+                })
+                payload_positions += len(boards)
+            else:
+                states = message.get("states", [])
+                state_count = len(states)
+                availables, available_values = _decode_request_availables(
+                    message,
+                    state_count,
+                )
+                metrics["parallel_request_state_bytes"] += int(
+                    getattr(states, "nbytes", 0)
+                )
+                metrics["parallel_request_available_values"] += int(available_values)
+                if message.get("request_format") == _COMPACT_PREDICTION_REQUEST:
+                    metrics["parallel_compact_requests"] += 1
+                inference_payloads.append({
+                    "states": states,
+                    "availables_batch": availables,
+                    "response_format": response_format,
+                })
+                payload_positions += state_count
+            pending_requests.append((
+                pipe,
+                message.get("request_id"),
+                start,
+                payload_positions - start,
+                response_format,
+            ))
+        metrics["parallel_payload_build_duration_s"] += time.perf_counter() - payload_build_start
+
+        if not pending_requests:
+            continue
+
+        inference_start = time.perf_counter()
+        evaluations, inference_batches = _evaluate_remote_policy_payloads(
+            policy_value_net,
+            inference_payloads,
+            config,
+        )
+        metrics["gpu_inference_duration_s"] += time.perf_counter() - inference_start
+        metrics["gpu_inference_requests"] += len(pending_requests)
+        metrics["gpu_inference_batches"] += inference_batches
+        metrics["gpu_inference_positions"] += payload_positions
+
+        _send_prediction_responses(pending_requests, evaluations, metrics)
+
+    batch_duration_s = time.perf_counter() - batch_start
+    metrics = _finish_parallel_metrics(metrics, batch_duration_s)
+    return results, metrics
+
+
+def _serve_parallel_self_play_stream(
+    policy_value_net,
+    config,
+    seed,
+    game_indices,
+    workers,
+    pipes,
+    logger,
+    on_game_result,
+    on_metrics,
+    should_stop=None,
+):
+    game_indices = list(game_indices)
+    assigned = list(zip(workers[:len(game_indices)], pipes[:len(game_indices)]))
+    if not assigned:
+        return {
+            "requested_games": len(game_indices),
+            "dispatched_games": 0,
+            "completed_games": 0,
+            "remaining_games": len(game_indices),
+            "stopped_early": bool(game_indices),
+            "elapsed_s": 0.0,
+        }
+
+    pipe_to_process = {pipe: process for process, pipe in assigned}
+    active_pipes = []
+    next_index = 0
+    completed_games = 0
+    stop_requested = False
+    dispatch_stop_estimate_s = 0.0
+    stream_start = time.perf_counter()
+    window_start = stream_start
+    window_metrics = _new_parallel_metrics(worker_count=len(assigned))
+    window_first_game = None
+    window_last_game = None
+    log_every_games = max(1, int(config.get("parallel_metrics_games", 8) or 8))
+    log_interval_s = max(1.0, float(config.get("parallel_metrics_interval_s", 30.0) or 30.0))
+    runtime_dispatch_estimate_games = max(
+        1,
+        int(config.get("runtime_dispatch_estimate_games", 4) or 4),
+    )
+    completed_game_durations = deque(maxlen=runtime_dispatch_estimate_games)
+    initial_dispatch_estimate_s = max(
+        0.0,
+        float(config.get("runtime_dispatch_initial_game_estimate_s", 0.0) or 0.0),
+    )
+
+    def estimated_game_duration_s():
+        if completed_game_durations:
+            return max(completed_game_durations)
+        return initial_dispatch_estimate_s
+
+    def dispatch(pipe):
+        nonlocal next_index, stop_requested, dispatch_stop_estimate_s
+        if next_index >= len(game_indices):
+            return False
+        estimate_s = estimated_game_duration_s()
+        if should_stop is not None and should_stop(estimate_s):
+            stop_requested = True
+            dispatch_stop_estimate_s = estimate_s
+            return False
+        game_idx = int(game_indices[next_index])
+        next_index += 1
+        pipe.send({
+            "type": "play",
+            "game_idx": game_idx,
+            "seed": int(seed + 30_000 + game_idx),
+        })
+        if pipe not in active_pipes:
+            active_pipes.append(pipe)
+        return True
+
+    def emit_metrics(force=False):
+        nonlocal window_metrics, window_start, window_first_game, window_last_game
+        now = time.perf_counter()
+        has_activity = (
+            window_metrics.get("parallel_batch_games", 0) > 0
+            or window_metrics.get("gpu_inference_requests", 0) > 0
+        )
+        if not has_activity:
+            return
+        if not force:
+            if window_metrics.get("parallel_batch_games", 0) < log_every_games and now - window_start < log_interval_s:
+                return
+        metrics = _finish_parallel_metrics(window_metrics, now - window_start)
+        metrics["parallel_completed_games"] = completed_games
+        metrics["parallel_remaining_games"] = len(game_indices) - completed_games
+        if window_first_game is not None:
+            metrics["batch_start_game"] = int(window_first_game)
+        if window_last_game is not None:
+            metrics["batch_end_game"] = int(window_last_game)
+        on_metrics(metrics)
+        window_start = time.perf_counter()
+        window_metrics = _new_parallel_metrics(worker_count=len(assigned))
+        window_first_game = None
+        window_last_game = None
+
+    for _process, pipe in assigned:
+        if not dispatch(pipe):
+            break
+
+    while active_pipes and completed_games < len(game_indices):
+        wait_start = time.perf_counter()
+        window_metrics["parallel_wait_calls"] += 1
+        ready_pipes = mp.connection.wait(active_pipes, timeout=1.0)
+        window_metrics["parallel_wait_duration_s"] += time.perf_counter() - wait_start
+        if not ready_pipes:
+            dead = [
+                process
+                for process in pipe_to_process.values()
+                if process.exitcode is not None and process.exitcode != 0
+            ]
+            if dead:
+                raise RuntimeError(
+                    "Parallel self-play worker exited early: "
+                    + ", ".join(str(process.pid) for process in dead)
+                )
+            emit_metrics()
+            continue
+
+        coalesce_s = max(
+            0.0,
+            float(config.get("gpu_inference_coalesce_ms", 0.0) or 0.0) / 1000.0,
+        )
+        coalesce_slice_s = max(
+            0.0,
+            float(config.get("gpu_inference_coalesce_slice_ms", 0.0) or 0.0)
+            / 1000.0,
+        )
+        ready_pipes, coalesce_metrics = _coalesce_ready_pipes(
+            active_pipes,
+            ready_pipes,
+            coalesce_s,
+            wait_slice_s=coalesce_slice_s,
+        )
+        window_metrics["parallel_coalesce_duration_s"] += coalesce_metrics["duration_s"]
+        window_metrics["parallel_coalesce_calls"] += coalesce_metrics["calls"]
+        window_metrics["parallel_coalesce_wait_calls"] += coalesce_metrics["wait_calls"]
+        window_metrics["parallel_coalesce_extra_pipes"] += coalesce_metrics["extra_pipes"]
+        window_metrics["parallel_coalesce_empty_waits"] += coalesce_metrics["empty_waits"]
+
+        pending_requests = []
+        inference_payloads = []
+        payload_positions = 0
+        payload_build_start = time.perf_counter()
+        window_metrics["parallel_ready_events"] += 1
+        window_metrics["parallel_ready_pipes"] += len(ready_pipes)
+        for pipe in ready_pipes:
+            try:
+                message = pipe.recv()
+            except EOFError as exc:
+                process = pipe_to_process.get(pipe)
+                raise RuntimeError(
+                    f"Parallel self-play worker pipe closed pid={getattr(process, 'pid', None)}"
+                ) from exc
+
+            if not isinstance(message, dict):
+                raise RuntimeError(f"Unexpected worker message: {message!r}")
+
+            window_metrics["parallel_messages"] += 1
+            message_type = message.get("type")
+            if message_type == "game_result":
+                window_metrics["parallel_game_result_messages"] += 1
+                game_idx = int(message["game_idx"])
+                completed_game_durations.append(
+                    max(0.0, float(message.get("duration_s", 0.0) or 0.0))
+                )
+                completed_games += 1
+                window_metrics["parallel_batch_games"] += 1
+                if window_first_game is None:
+                    window_first_game = game_idx
+                window_last_game = game_idx
+                per_game_parallel_metrics = {
+                    "parallel_workers": len(assigned),
+                    "parallel_completed_games": completed_games,
+                    "parallel_remaining_games": len(game_indices) - completed_games,
+                    "parallel_stream_elapsed_s": round(time.perf_counter() - stream_start, 3),
+                }
+                on_game_result(game_idx, message, per_game_parallel_metrics)
+                if not dispatch(pipe) and pipe in active_pipes:
+                    active_pipes.remove(pipe)
+                emit_metrics()
+                continue
+            if message_type == "worker_error":
+                raise RuntimeError(
+                    f"Parallel self-play worker {message.get('worker_id')} failed:\n"
+                    f"{message.get('traceback')}"
+                )
+            if message_type != "predict_batch":
+                raise RuntimeError(f"Unexpected worker message type: {message_type!r}")
+            window_metrics["parallel_predict_messages"] += 1
+
+            start = payload_positions
+            heuristic_weight = message.get("heuristic_prior_weight")
+            response_format = message.get("response_format")
+            boards = list(message.get("boards", []))
+            if boards:
+                inference_payloads.append({
+                    "boards": boards,
+                    "heuristic_prior_weight": heuristic_weight,
+                    "response_format": response_format,
+                })
+                payload_positions += len(boards)
+            else:
+                states = message.get("states", [])
+                state_count = len(states)
+                availables, available_values = _decode_request_availables(
+                    message,
+                    state_count,
+                )
+                window_metrics["parallel_request_state_bytes"] += int(
+                    getattr(states, "nbytes", 0)
+                )
+                window_metrics["parallel_request_available_values"] += int(available_values)
+                if message.get("request_format") == _COMPACT_PREDICTION_REQUEST:
+                    window_metrics["parallel_compact_requests"] += 1
+                inference_payloads.append({
+                    "states": states,
+                    "availables_batch": availables,
+                    "response_format": response_format,
+                })
+                payload_positions += state_count
+            pending_requests.append((
+                pipe,
+                message.get("request_id"),
+                start,
+                payload_positions - start,
+                response_format,
+            ))
+        window_metrics["parallel_payload_build_duration_s"] += (
+            time.perf_counter() - payload_build_start
+        )
+
+        if pending_requests:
+            inference_start = time.perf_counter()
+            evaluations, inference_batches = _evaluate_remote_policy_payloads(
+                policy_value_net,
+                inference_payloads,
+                config,
+            )
+            window_metrics["gpu_inference_duration_s"] += time.perf_counter() - inference_start
+            window_metrics["gpu_inference_requests"] += len(pending_requests)
+            window_metrics["gpu_inference_batches"] += inference_batches
+            window_metrics["gpu_inference_positions"] += payload_positions
+
+            _send_prediction_responses(
+                pending_requests,
+                evaluations,
+                window_metrics,
+            )
+        emit_metrics()
+
+    emit_metrics(force=True)
+    elapsed_s = time.perf_counter() - stream_start
+    remaining_games = max(0, len(game_indices) - completed_games)
+    return {
+        "requested_games": len(game_indices),
+        "dispatched_games": next_index,
+        "completed_games": completed_games,
+        "remaining_games": remaining_games,
+        "stopped_early": bool(stop_requested or remaining_games),
+        "elapsed_s": round(elapsed_s, 3),
+        "dispatch_stop_estimated_game_s": round(dispatch_stop_estimate_s, 3),
+    }
 
 
 def _heuristic_play_data(config, seed):
@@ -1833,6 +3137,170 @@ def _apply_self_play_draw_value(play_data, winner, draw_value):
     ]
 
 
+def _mean_numeric(values):
+    values = [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float, np.number))
+        and np.isfinite(float(value))
+    ]
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
+def _self_play_target_transform_spec(config):
+    transform = config.get("self_play_target_transform", "identity")
+    if transform in (None, "", False):
+        transform = "identity"
+    return build_transform_spec(
+        str(transform),
+        power=float(config.get("self_play_target_power", 2.0) or 2.0),
+        top_k=config.get("self_play_target_top_k"),
+        min_prob=config.get("self_play_target_min_prob"),
+    )
+
+
+def _self_play_policy_summary(play_data):
+    summary = summarize_replay_samples(play_data)
+    return summary.get("policy_targets", {})
+
+
+def _policy_summary_mean(summary, *path):
+    value = summary
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    if isinstance(value, (int, float, np.number)):
+        return float(value)
+    return None
+
+
+def _self_play_target_transform_fields(spec, original_play_data, transformed_play_data, details):
+    active = spec.get("name") != "identity"
+    fields = {
+        "policy_target_transform_active": 1.0 if active else 0.0,
+        "policy_target_transform_invalid_policy_samples": 0,
+        "policy_target_transform_retained_mass_mean": None,
+        "policy_target_transform_support_kept_fraction_mean": None,
+        "policy_target_transform_changed_top1_fraction": None,
+        "policy_target_transform_fallback_top1_fraction": None,
+        "policy_target_transform_max_prob_delta": None,
+        "policy_target_transform_normalized_entropy_delta": None,
+    }
+    if not details:
+        return fields
+
+    valid_details = [detail for detail in details if detail.get("valid")]
+    divisor = len(valid_details) or 1
+    fields.update({
+        "policy_target_transform_invalid_policy_samples": len(details) - len(valid_details),
+        "policy_target_transform_retained_mass_mean": _mean_numeric(
+            detail.get("retained_mass_before_renorm")
+            for detail in valid_details
+        ),
+        "policy_target_transform_support_kept_fraction_mean": _mean_numeric(
+            detail.get("support_kept_fraction")
+            for detail in valid_details
+        ),
+        "policy_target_transform_changed_top1_fraction": (
+            sum(1 for detail in valid_details if detail.get("changed_top1"))
+            / divisor
+        ),
+        "policy_target_transform_fallback_top1_fraction": (
+            sum(1 for detail in valid_details if detail.get("fallback_to_top1"))
+            / divisor
+        ),
+    })
+
+    original_policy = _self_play_policy_summary(original_play_data)
+    transformed_policy = _self_play_policy_summary(transformed_play_data)
+    original_max_prob = _policy_summary_mean(original_policy, "max_prob", "mean")
+    transformed_max_prob = _policy_summary_mean(transformed_policy, "max_prob", "mean")
+    original_entropy = _policy_summary_mean(
+        original_policy,
+        "normalized_entropy",
+        "mean",
+    )
+    transformed_entropy = _policy_summary_mean(
+        transformed_policy,
+        "normalized_entropy",
+        "mean",
+    )
+    if original_max_prob is not None and transformed_max_prob is not None:
+        fields["policy_target_transform_max_prob_delta"] = (
+            transformed_max_prob - original_max_prob
+        )
+    if original_entropy is not None and transformed_entropy is not None:
+        fields["policy_target_transform_normalized_entropy_delta"] = (
+            transformed_entropy - original_entropy
+        )
+    return fields
+
+
+def _apply_self_play_target_transform(play_data, config):
+    play_data = list(play_data)
+    spec = _self_play_target_transform_spec(config)
+    if spec.get("name") == "identity":
+        return play_data, {
+            "policy_target_transform": "identity",
+            **_self_play_target_transform_fields(spec, play_data, play_data, []),
+        }
+
+    transformed = []
+    details = []
+    for state, policy_target, value in play_data:
+        transformed_policy, detail = transform_policy_target(
+            policy_target,
+            power=spec.get("power", 1.0),
+            top_k=spec.get("top_k"),
+            min_prob=spec.get("min_prob"),
+        )
+        details.append(detail)
+        if not detail.get("valid"):
+            transformed_policy = np.asarray(policy_target, dtype=np.float64)
+        transformed.append((state, transformed_policy, value))
+
+    return transformed, {
+        "policy_target_transform": spec["name"],
+        **_self_play_target_transform_fields(spec, play_data, transformed, details),
+    }
+
+
+def _self_play_target_quality_fields(play_data):
+    summary = summarize_replay_samples(play_data)
+    policy = summary.get("policy_targets", {})
+    value = summary.get("value_targets", {})
+    max_prob = policy.get("max_prob") or {}
+    entropy = policy.get("entropy") or {}
+    normalized_entropy = policy.get("normalized_entropy") or {}
+    nonzero = policy.get("nonzero_actions") or {}
+    return {
+        "policy_target_samples": int(summary.get("samples", 0) or 0),
+        "policy_target_invalid_samples": int(
+            policy.get("invalid_policy_samples", 0) or 0
+        ),
+        "policy_target_max_prob_mean": max_prob.get("mean"),
+        "policy_target_max_prob_median": max_prob.get("median"),
+        "policy_target_entropy_mean": entropy.get("mean"),
+        "policy_target_entropy_median": entropy.get("median"),
+        "policy_target_normalized_entropy_mean": normalized_entropy.get("mean"),
+        "policy_target_normalized_entropy_median": normalized_entropy.get("median"),
+        "policy_target_nonzero_actions_mean": nonzero.get("mean"),
+        "policy_target_diffuse_fraction": policy.get(
+            "diffuse_max_prob_le_0_02_fraction"
+        ),
+        "policy_target_sharp_fraction": policy.get(
+            "sharp_max_prob_ge_0_25_fraction"
+        ),
+        "policy_target_one_hot_fraction": policy.get("one_hot_fraction"),
+        "value_target_positive_fraction": value.get("positive_fraction"),
+        "value_target_negative_fraction": value.get("negative_fraction"),
+        "value_target_draw_fraction": value.get("draw_fraction"),
+    }
+
+
 def _anchor_distillation_data(anchor_policy, data_buffer, config, seed, count):
     if count <= 0 or not data_buffer:
         return []
@@ -1863,9 +3331,24 @@ def _public_config(config):
         "architecture",
         "self_play_mode",
         "self_play_games",
+        "self_play_parallel_games",
+        "self_play_parallel_cap_to_cpu",
+        "self_play_parallel_cpu_multiplier",
         "n_playout",
         "eval_n_playout",
+        "eval_parallel_games",
+        "eval_parallel_cap_to_cpu",
+        "eval_parallel_cpu_multiplier",
         "mcts_tactical_threshold",
+        "mcts_batch_size",
+        "mcts_min_batches_per_search",
+        "gpu_inference_max_batch_size",
+        "gpu_inference_coalesce_ms",
+        "gpu_inference_coalesce_slice_ms",
+        "gpu_inference_compact_request",
+        "gpu_inference_state_dtype",
+        "gpu_inference_compact_response",
+        "mcts_heuristic_prior_weight",
         "mcts_two_ply_threats",
         "mcts_two_ply_max_candidates",
         "mcts_two_ply_max_replies",
@@ -1889,6 +3372,7 @@ def _public_config(config):
         "mcts_tactical_leaf_max_replies",
         "mcts_tactical_leaf_max_followups",
         "eval_games",
+        "internal_eval_games",
         "batch_size",
         "epochs",
         "expert_games",
@@ -1961,6 +3445,10 @@ def _public_config(config):
         "self_play_draw_value",
         "self_play_temp_cutoff",
         "self_play_late_temp",
+        "self_play_target_transform",
+        "self_play_target_power",
+        "self_play_target_top_k",
+        "self_play_target_min_prob",
         "conversion_replay_size",
         "conversion_replay_fraction",
         "conversion_replay_extra_steps",
@@ -1994,6 +3482,10 @@ def _public_config(config):
         "beam_fork_threshold",
         "seed",
         "init_from",
+        "max_runtime_minutes",
+        "max_runtime_dispatch_margin_minutes",
+        "runtime_dispatch_estimate_games",
+        "runtime_dispatch_initial_game_estimate_s",
     ]
     return {key: config[key] for key in keys if key in config}
 
@@ -2153,9 +3645,25 @@ def run_baseline_training(
     checkpoint_dir="checkpoints",
     init_agent=None,
     resume_best=False,
+    max_runtime_minutes=None,
+    max_runtime_dispatch_margin_minutes=None,
 ):
     """Run a bounded local trainer that produces frontend-playable checkpoints."""
     config = get_training_preset(preset)
+    if max_runtime_dispatch_margin_minutes is None:
+        max_runtime_dispatch_margin_minutes = config.get(
+            "max_runtime_dispatch_margin_minutes",
+            0.0,
+        )
+    runtime_budget = _RuntimeBudget(
+        max_runtime_minutes,
+        dispatch_margin_minutes=max_runtime_dispatch_margin_minutes,
+    )
+    if runtime_budget.enabled:
+        config["max_runtime_minutes"] = runtime_budget.max_runtime_minutes
+        config["max_runtime_dispatch_margin_minutes"] = (
+            runtime_budget.dispatch_margin_minutes
+        )
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     registry_path = checkpoint_dir / "registry.json"
@@ -2167,6 +3675,7 @@ def run_baseline_training(
         "event": "run_start",
         "preset": preset,
         "config": _public_config(config),
+        **runtime_budget.summary(),
     }, checkpoint_dir)
 
     seed = config.get("seed")
@@ -2239,6 +3748,8 @@ def run_baseline_training(
     replay_games_recorded = replay_metadata["replay_loaded_games"]
     history = {"bootstrap": [], "self_play": [], "training": [], "checkpoints": []}
     last_train_metrics = {}
+    completed_self_play_games = 0
+    last_self_play_game_idx = 0
 
     anchor_samples = int(config.get("anchor_samples", 0) or 0)
     if init_model_path is not None and anchor_samples and data_buffer:
@@ -2297,6 +3808,7 @@ def run_baseline_training(
             state["optimizer_loaded_from"] = optimizer_loaded_from
         return state
 
+    checkpoint_start = time.perf_counter()
     initial_entry = _save_registered_checkpoint(
         policy_value_net,
         config,
@@ -2313,6 +3825,7 @@ def run_baseline_training(
             "note": "Initial checkpoint for this run; may be random or loaded from init_from.",
         },
     )
+    initial_checkpoint_duration_s = time.perf_counter() - checkpoint_start
     logger.info("Saved initial checkpoint: %s", initial_entry["path"])
     append_training_event({
         "event": "checkpoint_saved",
@@ -2321,6 +3834,7 @@ def run_baseline_training(
         "checkpoint_id": initial_entry["id"],
         "elo": initial_entry["elo"],
         "games_trained": initial_entry["games_trained"],
+        "checkpoint_duration_s": round(initial_checkpoint_duration_s, 3),
     }, checkpoint_dir)
 
     saved_entries = [initial_entry]
@@ -2338,6 +3852,7 @@ def run_baseline_training(
         start = time.time()
         winner, expert_data, moves = _heuristic_play_data(config, seed + expert_idx)
         duration_s = time.time() - start
+        moves_per_second = (len(moves) / duration_s) if duration_s > 0 else 0.0
         expert_data = list(expert_data)
         augmented_expert_data = augment_play_data(
             expert_data,
@@ -2354,6 +3869,7 @@ def run_baseline_training(
             "moves": int(len(moves)),
             "buffer_size": int(len(data_buffer)),
             "duration_s": round(duration_s, 3),
+            "moves_per_second": round(moves_per_second, 4),
         }
         history["bootstrap"].append(bootstrap_record)
         append_training_event({
@@ -2632,28 +4148,34 @@ def run_baseline_training(
             last_train_metrics,
         )
 
-    for game_idx in range(1, config["self_play_games"] + 1):
-        board = _new_board(config)
-        game = Game(board)
+    def process_self_play_result(
+        game_idx,
+        winner,
+        play_data,
+        moves,
+        duration_s,
+        self_play_stats,
+        parallel_metrics=None,
+    ):
+        nonlocal last_train_metrics, replay_games_recorded
+        nonlocal completed_self_play_games, last_self_play_game_idx
+
+        completed_self_play_games += 1
+        last_self_play_game_idx = max(last_self_play_game_idx, int(game_idx))
+        parallel_metrics = dict(parallel_metrics or {})
         self_play_mode = config.get("self_play_mode", "mcts")
-        self_play_player = _new_self_play_player(
-            policy_value_net,
-            config,
-            seed + 30_000 + game_idx,
-        )
-        start = time.time()
-        winner, play_data, moves = game.start_self_play(
-            self_play_player,
-            is_shown=0,
-            temp=_self_play_temperature(config),
-        )
-        duration_s = time.time() - start
+        moves_per_second = (len(moves) / duration_s) if duration_s > 0 else 0.0
         play_data = list(play_data)
         play_data = _apply_self_play_draw_value(
             play_data,
             winner,
             config.get("self_play_draw_value", 0.0),
         )
+        play_data, target_transform_fields = _apply_self_play_target_transform(
+            play_data,
+            config,
+        )
+        target_quality_fields = _self_play_target_quality_fields(play_data)
         augmented_self_play_data = augment_play_data(
             play_data,
             config["board_height"],
@@ -2777,8 +4299,12 @@ def run_baseline_training(
             "conversion_teacher_positions": len(conversion_teacher_data),
             "conversion_teacher_samples": len(conversion_teacher_buffer),
             "duration_s": round(duration_s, 3),
+            "moves_per_second": round(moves_per_second, 4),
         }
-        self_play_record.update(_self_play_stats(self_play_player, self_play_mode))
+        self_play_record.update(target_quality_fields)
+        self_play_record.update(target_transform_fields)
+        self_play_record.update(self_play_stats)
+        self_play_record.update(parallel_metrics)
         if main_train_metrics:
             self_play_record.update(_train_metric_fields(main_train_metrics))
         if conversion_train_metrics:
@@ -2802,10 +4328,11 @@ def run_baseline_training(
             "event": "self_play_game",
             "preset": preset,
             **self_play_record,
+            **parallel_metrics,
         }, checkpoint_dir)
 
         logger.info(
-            "Self-play game %s/%s: mode=%s winner=%s moves=%s buffer=%s duration=%.2fs stats=%s main_metrics=%s conversion_metrics=%s teacher_metrics=%s",
+            "Self-play game %s/%s: mode=%s winner=%s moves=%s buffer=%s duration=%.2fs stats=%s parallel_metrics=%s main_metrics=%s conversion_metrics=%s teacher_metrics=%s",
             game_idx,
             config["self_play_games"],
             self_play_mode,
@@ -2813,13 +4340,15 @@ def run_baseline_training(
             len(moves),
             len(data_buffer),
             duration_s,
-            _self_play_stats(self_play_player, self_play_mode),
+            self_play_stats,
+            parallel_metrics,
             main_train_metrics,
             conversion_train_metrics,
             conversion_teacher_metrics,
         )
 
         if game_idx % config["save_freq"] == 0 and game_idx != config["self_play_games"]:
+            replay_start = time.perf_counter()
             replay_saved = _save_replay_buffer(
                 replay_file,
                 data_buffer,
@@ -2827,8 +4356,10 @@ def run_baseline_training(
                 replay_games_recorded,
                 logger,
             )
+            replay_save_duration_s = time.perf_counter() - replay_start
             training_state = current_training_state()
             training_state["replay_saved"] = replay_saved
+            checkpoint_start = time.perf_counter()
             entry = _save_registered_checkpoint(
                 policy_value_net,
                 config,
@@ -2845,6 +4376,7 @@ def run_baseline_training(
                     "note": "Mid-run checkpoint before final evaluation.",
                 },
             )
+            checkpoint_duration_s = time.perf_counter() - checkpoint_start
             saved_entries.append(entry)
             history["checkpoints"].append({
                 "tag": "mid",
@@ -2861,8 +4393,150 @@ def run_baseline_training(
                 "checkpoint_id": entry["id"],
                 "elo": entry["elo"],
                 "games_trained": entry["games_trained"],
+                "checkpoint_duration_s": round(checkpoint_duration_s, 3),
+                "replay_save_duration_s": round(replay_save_duration_s, 3),
             }, checkpoint_dir)
 
+    self_play_phase_start = time.perf_counter()
+    self_play_stream_summary = {
+        "requested_games": int(config["self_play_games"]),
+        "dispatched_games": 0,
+        "completed_games": 0,
+        "remaining_games": int(config["self_play_games"]),
+        "stopped_early": False,
+        "elapsed_s": 0.0,
+    }
+    parallel_workers = []
+    parallel_pipes = []
+    try:
+        parallel_worker_count = _parallel_self_play_worker_count(config)
+        if parallel_worker_count > 1 and config.get("self_play_mode", "mcts") == "mcts":
+            parallel_workers, parallel_pipes = _start_parallel_self_play_workers(
+                config,
+                logger,
+            )
+            all_parallel_indices = list(range(1, config["self_play_games"] + 1))
+
+            def log_parallel_metrics(batch_metrics):
+                game_step = int(
+                    batch_metrics.get("batch_end_game")
+                    or batch_metrics.get("parallel_completed_games")
+                    or 0
+                )
+                append_training_event({
+                    "event": "parallel_self_play_batch",
+                    "preset": preset,
+                    "game": game_step,
+                    "total_games": base_games_trained + game_step,
+                    **{
+                        key: value
+                        for key, value in batch_metrics.items()
+                        if isinstance(value, (int, float))
+                    },
+                }, checkpoint_dir)
+
+            def handle_parallel_result(game_idx, result, per_game_parallel_metrics):
+                process_self_play_result(
+                    game_idx,
+                    result["winner"],
+                    result["play_data"],
+                    result["moves"],
+                    float(result["duration_s"]),
+                    dict(result.get("stats") or {}),
+                    parallel_metrics=per_game_parallel_metrics,
+                )
+
+            stream_summary = _serve_parallel_self_play_stream(
+                policy_value_net,
+                config,
+                seed,
+                all_parallel_indices,
+                parallel_workers,
+                parallel_pipes,
+                logger,
+                on_game_result=handle_parallel_result,
+                on_metrics=log_parallel_metrics,
+                should_stop=runtime_budget.should_stop_dispatch,
+            )
+            if stream_summary:
+                self_play_stream_summary.update(stream_summary)
+        else:
+            last_sequential_game_duration_s = max(
+                0.0,
+                float(config.get("runtime_dispatch_initial_game_estimate_s", 0.0) or 0.0),
+            )
+            for game_idx in range(1, config["self_play_games"] + 1):
+                if runtime_budget.should_stop_dispatch(last_sequential_game_duration_s):
+                    logger.info(
+                        "Runtime dispatch budget reached before self-play game %s/%s; "
+                        "stopping after %s completed games.",
+                        game_idx,
+                        config["self_play_games"],
+                        completed_self_play_games,
+                    )
+                    self_play_stream_summary["stopped_early"] = True
+                    break
+                self_play_stream_summary["dispatched_games"] += 1
+                board = _new_board(config)
+                game = Game(board)
+                self_play_mode = config.get("self_play_mode", "mcts")
+                self_play_player = _new_self_play_player(
+                    policy_value_net,
+                    config,
+                    seed + 30_000 + game_idx,
+                )
+                start = time.time()
+                winner, play_data, moves = game.start_self_play(
+                    self_play_player,
+                    is_shown=0,
+                    temp=_self_play_temperature(config),
+                )
+                game_duration_s = time.time() - start
+                process_self_play_result(
+                    game_idx,
+                    winner,
+                    play_data,
+                    moves,
+                    game_duration_s,
+                    _self_play_stats(self_play_player, self_play_mode),
+                )
+                last_sequential_game_duration_s = game_duration_s
+    finally:
+        if parallel_workers:
+            _stop_parallel_self_play_workers(parallel_workers, parallel_pipes, logger)
+
+    if not self_play_stream_summary.get("elapsed_s"):
+        self_play_stream_summary["elapsed_s"] = round(
+            time.perf_counter() - self_play_phase_start,
+            3,
+        )
+    self_play_stream_summary["completed_games"] = int(completed_self_play_games)
+    self_play_stream_summary["remaining_games"] = max(
+        0,
+        int(config["self_play_games"]) - int(completed_self_play_games),
+    )
+    if completed_self_play_games < int(config["self_play_games"]) and runtime_budget.enabled:
+        self_play_stream_summary["stopped_early"] = True
+    if runtime_budget.enabled:
+        budget_summary = runtime_budget.summary()
+        append_training_event({
+            "event": "runtime_budget",
+            "preset": preset,
+            "game": int(completed_self_play_games),
+            "total_games": base_games_trained + int(completed_self_play_games),
+            "self_play_requested_games": int(config["self_play_games"]),
+            "self_play_dispatched_games": int(self_play_stream_summary.get("dispatched_games", 0)),
+            "self_play_completed_games": int(completed_self_play_games),
+            "self_play_remaining_games": int(self_play_stream_summary["remaining_games"]),
+            "self_play_stopped_early": bool(self_play_stream_summary.get("stopped_early")),
+            "self_play_stream_elapsed_s": float(self_play_stream_summary.get("elapsed_s", 0.0) or 0.0),
+            "self_play_dispatch_stop_estimated_game_s": float(
+                self_play_stream_summary.get("dispatch_stop_estimated_game_s", 0.0) or 0.0
+            ),
+            **budget_summary,
+        }, checkpoint_dir)
+
+    replay_start = time.perf_counter()
     replay_saved = _save_replay_buffer(
         replay_file,
         data_buffer,
@@ -2870,15 +4544,29 @@ def run_baseline_training(
         replay_games_recorded,
         logger,
     )
+    replay_save_duration_s = time.perf_counter() - replay_start
     training_state = current_training_state()
     training_state["replay_saved"] = replay_saved
+    training_state["runtime_budget"] = runtime_budget.summary()
+    training_state["self_play_requested_games"] = int(config["self_play_games"])
+    training_state["self_play_completed_games"] = int(completed_self_play_games)
+    training_state["self_play_dispatched_games"] = int(
+        self_play_stream_summary.get("dispatched_games", 0)
+    )
+    training_state["self_play_stopped_early"] = bool(
+        self_play_stream_summary.get("stopped_early")
+    )
+    eval_start = time.perf_counter()
     eval_results, elo = _evaluate_policy(policy_value_net, config)
+    eval_duration_s = time.perf_counter() - eval_start
+    checkpoint_start = time.perf_counter()
+    final_games_trained = base_games_trained + int(completed_self_play_games)
     final_entry = _save_registered_checkpoint(
         policy_value_net,
         config,
         checkpoint_dir,
         tag="final",
-        games_trained=base_games_trained + config["self_play_games"],
+        games_trained=final_games_trained,
         metrics={
             "elo": elo,
             "config": _public_config(config),
@@ -2887,13 +4575,20 @@ def run_baseline_training(
             "init_from": config.get("init_from"),
             "training_state": training_state,
             "last_train": last_train_metrics,
+            "self_play_requested_games": int(config["self_play_games"]),
+            "self_play_completed_games": int(completed_self_play_games),
+            "self_play_stopped_early": bool(
+                self_play_stream_summary.get("stopped_early")
+            ),
+            "runtime_budget": runtime_budget.summary(),
         },
     )
+    checkpoint_duration_s = time.perf_counter() - checkpoint_start
     saved_entries.append(final_entry)
     history["checkpoints"].append({
         "tag": "final",
-        "game": config["self_play_games"],
-        "total_games": base_games_trained + config["self_play_games"],
+        "game": int(completed_self_play_games),
+        "total_games": final_games_trained,
         "path": final_entry["path"],
         "elo": final_entry["elo"],
     })
@@ -2906,7 +4601,16 @@ def run_baseline_training(
         "checkpoint_id": final_entry["id"],
         "elo": final_entry["elo"],
         "games_trained": final_entry["games_trained"],
+        "self_play_requested_games": int(config["self_play_games"]),
+        "self_play_completed_games": int(completed_self_play_games),
+        "self_play_dispatched_games": int(self_play_stream_summary.get("dispatched_games", 0)),
+        "self_play_remaining_games": int(self_play_stream_summary["remaining_games"]),
+        "self_play_stopped_early": bool(self_play_stream_summary.get("stopped_early")),
+        **runtime_budget.summary(),
         "eval": eval_results,
+        "checkpoint_duration_s": round(checkpoint_duration_s, 3),
+        "replay_save_duration_s": round(replay_save_duration_s, 3),
+        "eval_duration_s": round(eval_duration_s, 3),
     }, checkpoint_dir)
     return {
         "config": config,

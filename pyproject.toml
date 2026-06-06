@@ -28,10 +28,15 @@ py-modules = [
     "mcts",
     "model",
     "players",
+    "replay_audit",
     "reproduce_logger",
+    "remote_health_check",
+    "resource_monitor",
     "tactical",
+    "tensorboard_audit",
     "tracking",
     "train",
+    "training_audit",
     "web_app",
 ]
 

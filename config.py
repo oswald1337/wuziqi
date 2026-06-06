@@ -1702,13 +1702,14 @@ TRAINING_PRESETS = {
         "board_width": 16,
         "board_height": 16,
         "n_in_row": 5,
-        "num_res_blocks": 6,
-        "num_filters": 96,
+        "num_res_blocks": 4,
+        "num_filters": 64,
         "architecture": "conv_attention",
         "self_play_games": 512,
         "n_playout": 256,
         "eval_n_playout": 256,
         "eval_games": 32,
+        "internal_eval_games": 0,
         "batch_size": 512,
         "buffer_size": 200000,
         "epochs": 5,
@@ -1720,6 +1721,23 @@ TRAINING_PRESETS = {
         "temp": 1.0,
         "save_freq": 32,
         "use_gpu": True,
+        "self_play_parallel_games": "auto",
+        "self_play_parallel_cap_to_cpu": True,
+        "self_play_parallel_cpu_multiplier": 1.0,
+        "eval_parallel_games": "auto",
+        "eval_parallel_cap_to_cpu": True,
+        "eval_parallel_cpu_multiplier": 1.0,
+        "gpu_inference_max_batch_size": 512,
+        "gpu_inference_coalesce_ms": 25,
+        "gpu_inference_coalesce_slice_ms": 3,
+        "gpu_inference_compact_request": True,
+        "gpu_inference_state_dtype": "uint8",
+        "gpu_inference_compact_response": True,
+        "mcts_batch_size": 128,
+        "mcts_min_batches_per_search": 4,
+        "mcts_heuristic_prior_weight": 0.0,
+        "self_play_target_transform": "top_k",
+        "self_play_target_top_k": 16,
     },
     "large_16x16_wider": {
         "board_width": 16,
@@ -1882,6 +1900,11 @@ def get_training_preset(name):
     config.setdefault("self_play_draw_value", 0.0)
     config.setdefault("self_play_temp_cutoff", None)
     config.setdefault("self_play_late_temp", config.get("temp", 1.0))
+    config.setdefault("self_play_target_transform", "identity")
+    config.setdefault("self_play_target_power", 2.0)
+    config.setdefault("self_play_target_top_k", None)
+    config.setdefault("self_play_target_min_prob", None)
+    config.setdefault("internal_eval_games", config.get("eval_games", 0))
     config.setdefault("conversion_replay_size", 0)
     config.setdefault("conversion_replay_fraction", 0.0)
     config.setdefault("conversion_replay_extra_steps", 0)
@@ -1951,7 +1974,22 @@ def get_training_preset(name):
     config.setdefault("mcts_distill_tactical_leaf_max_candidates", 16)
     config.setdefault("mcts_distill_tactical_leaf_max_replies", 6)
     config.setdefault("mcts_distill_tactical_leaf_max_followups", 12)
+    config.setdefault("self_play_parallel_games", 1)
+    config.setdefault("self_play_parallel_cap_to_cpu", True)
+    config.setdefault("self_play_parallel_cpu_multiplier", 1.0)
+    config.setdefault("eval_parallel_games", 1)
+    config.setdefault("eval_parallel_cap_to_cpu", True)
+    config.setdefault("eval_parallel_cpu_multiplier", 1.0)
+    config.setdefault("gpu_inference_max_batch_size", 512)
+    config.setdefault("gpu_inference_coalesce_ms", 0)
+    config.setdefault("gpu_inference_coalesce_slice_ms", 0)
+    config.setdefault("gpu_inference_compact_request", True)
+    config.setdefault("gpu_inference_state_dtype", "uint8")
+    config.setdefault("gpu_inference_compact_response", True)
     config.setdefault("mcts_tactical_threshold", 250000.0)
+    config.setdefault("mcts_batch_size", 1)
+    config.setdefault("mcts_min_batches_per_search", 1)
+    config.setdefault("mcts_heuristic_prior_weight", None)
     config.setdefault("mcts_two_ply_threats", False)
     config.setdefault("mcts_two_ply_max_candidates", 16)
     config.setdefault("mcts_two_ply_max_replies", 6)

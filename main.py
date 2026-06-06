@@ -1,3 +1,13 @@
+import os
+
+for _thread_env in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env, "1")
+
 import argparse
 from config import IMPROVEMENT_PRESETS, preset_names
 from evaluator import evaluate_checkpoint
@@ -8,7 +18,14 @@ from game import Board, Game
 from mcts import MCTSPlayer
 from model import PolicyValueNet
 
-def run_training(preset="shopping_baseline", debug=False, resume_best=False, init_agent_id=None):
+def run_training(
+    preset="shopping_baseline",
+    debug=False,
+    resume_best=False,
+    init_agent_id=None,
+    max_runtime_minutes=None,
+    max_runtime_dispatch_margin_minutes=None,
+):
     if debug:
         preset = "debug"
     if preset == "full":
@@ -22,6 +39,8 @@ def run_training(preset="shopping_baseline", debug=False, resume_best=False, ini
             preset=preset,
             init_agent=init_agent,
             resume_best=resume_best,
+            max_runtime_minutes=max_runtime_minutes,
+            max_runtime_dispatch_margin_minutes=max_runtime_dispatch_margin_minutes,
         )
         final = result["final"]
         print(f"Saved final checkpoint: {final['path']}")
@@ -59,10 +78,14 @@ if __name__ == '__main__':
     parser.add_argument('--presets', type=str, default=None, help='Comma-separated presets for improve mode')
     parser.add_argument('--eval-games', type=int, default=16, help='Evaluation games per opponent for evaluate/improve mode')
     parser.add_argument('--previous-best-games', type=int, default=None, help='Games against previous best checkpoint')
+    parser.add_argument('--eval-n-playout', type=int, default=None, help='Candidate MCTS playouts for evaluate/improve diagnostics')
+    parser.add_argument('--opponent-eval-n-playout', type=int, default=None, help='Opponent MCTS playouts for evaluate/improve diagnostics')
     parser.add_argument('--eval-mode', type=str, default='mcts', choices=['mcts', 'native', 'tactical_beam'], help='Candidate player mode for evaluate diagnostics')
     parser.add_argument('--opponent-eval-mode', type=str, default='mcts', choices=['mcts', 'native', 'tactical_beam'], help='Checkpoint opponent player mode for evaluate diagnostics')
     parser.add_argument('--no-promote', action='store_true', help='Run evaluate mode without updating promotion/champion registry fields')
     parser.add_argument('--rounds', type=int, default=1, help='Improvement rounds to run over the selected presets')
+    parser.add_argument('--max-runtime-minutes', type=float, default=None, help='Stop training after this wall-clock budget, then save replay/checkpoint and continue cleanup/eval')
+    parser.add_argument('--max-runtime-dispatch-margin-minutes', type=float, default=None, help='Stop dispatching new self-play games this many minutes before the runtime budget is projected to expire')
     parser.add_argument('--keep-going-after-gate', action='store_true', help='Continue improve mode even after the completion gate passes')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='Web server host')
     parser.add_argument('--port', type=int, default=8000, help='Web server port')
@@ -75,6 +98,8 @@ if __name__ == '__main__':
             debug=args.debug,
             resume_best=args.resume_best,
             init_agent_id=args.init_agent,
+            max_runtime_minutes=args.max_runtime_minutes,
+            max_runtime_dispatch_margin_minutes=args.max_runtime_dispatch_margin_minutes,
         )
     elif args.mode == 'play':
         play_game(args.model)
@@ -88,6 +113,8 @@ if __name__ == '__main__':
             args.agent,
             games=args.eval_games,
             previous_best_games=args.previous_best_games,
+            n_playout=args.eval_n_playout,
+            opponent_n_playout=args.opponent_eval_n_playout,
             eval_mode=args.eval_mode,
             opponent_eval_mode=args.opponent_eval_mode,
             promote=not args.no_promote,
@@ -107,6 +134,12 @@ if __name__ == '__main__':
             resume_best=not args.fresh,
             rounds=args.rounds,
             stop_on_gate=not args.keep_going_after_gate,
+            max_runtime_minutes=args.max_runtime_minutes,
+            max_runtime_dispatch_margin_minutes=args.max_runtime_dispatch_margin_minutes,
+            eval_n_playout=args.eval_n_playout,
+            opponent_eval_n_playout=args.opponent_eval_n_playout,
+            eval_mode=args.eval_mode,
+            opponent_eval_mode=args.opponent_eval_mode,
         )
         for result in results:
             promotion = result["evaluation"]["promotion"]

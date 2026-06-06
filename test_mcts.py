@@ -6,7 +6,8 @@ from checkpoint_registry import (
     has_current_promotion,
     register_checkpoint,
 )
-from mcts import MCTS, MCTSPlayer, tactical_leaf_value
+from evaluator import _match_record
+from mcts import MCTS, MCTSPlayer, TreeNode, tactical_leaf_value
 from model import PolicyValueNet
 from players import HeuristicPlayer
 from tactical import (
@@ -70,6 +71,31 @@ def _place(board, move, player):
     board.states[move] = player
     board.availables.remove(move)
     board.last_move = move
+
+
+def test_tree_node_select_matches_puct_formula():
+    root = TreeNode(None, 1.0)
+    root.n_visits = 64
+    for action, (prior, visits, q_value, virtual_loss) in enumerate([
+        (0.50, 10, 0.20, 0),
+        (0.25, 2, 0.10, 1),
+        (0.15, 0, -0.10, 0),
+        (0.10, 5, 0.50, 0),
+    ]):
+        child = TreeNode(root, prior)
+        child.n_visits = visits
+        child.Q = q_value
+        child.virtual_loss = virtual_loss
+        root.children[action] = child
+
+    action, node = root.select(5)
+
+    expected_action, expected_node = max(
+        root.children.items(),
+        key=lambda item: item[1].get_value(5),
+    )
+    assert action == expected_action
+    assert node is expected_node
 
 
 def test_mcts_takes_immediate_win():
@@ -154,6 +180,73 @@ def test_mcts_tactical_prior_biases_root_search_without_forcing():
     assert prior_target_mass > plain_target_mass
     assert prior_player.forced_tactical_moves == 0
     assert prior_player.tactical_prior_searches == 1
+
+
+def test_mcts_can_batch_leaf_policy_evaluations():
+    board = Board(width=5, height=5, n_in_row=4)
+    board.init_board()
+    calls = {"single": 0, "batch": 0, "batch_positions": 0}
+
+    def single_policy(board):
+        calls["single"] += 1
+        return _flat_policy(board)
+
+    def batch_policy(boards):
+        boards = list(boards)
+        calls["batch"] += 1
+        calls["batch_positions"] += len(boards)
+        return [_flat_policy(item) for item in boards]
+
+    player = MCTSPlayer(
+        single_policy,
+        n_playout=9,
+        use_parallel=False,
+        policy_value_batch_function=batch_policy,
+        mcts_batch_size=4,
+        tactical_threshold=WIN_SCORE,
+    )
+    move, probs = player.get_action(board, temp=1.0, return_prob=1)
+
+    assert move in range(board.width * board.height)
+    assert abs(float(sum(probs)) - 1.0) < 1e-6
+    assert calls["single"] == 1
+    assert calls["batch"] == 2
+    assert calls["batch_positions"] == 8
+    assert player.batched_policy_batches == 2
+    assert player.batched_policy_positions == 8
+
+
+def test_mcts_batch_size_can_preserve_multiple_search_waves():
+    board = Board(width=5, height=5, n_in_row=4)
+    board.init_board()
+    calls = {"batch_sizes": []}
+
+    def single_policy(board):
+        return _flat_policy(board)
+
+    def batch_policy(boards):
+        boards = list(boards)
+        calls["batch_sizes"].append(len(boards))
+        return [_flat_policy(item) for item in boards]
+
+    player = MCTSPlayer(
+        single_policy,
+        n_playout=9,
+        use_parallel=False,
+        policy_value_batch_function=batch_policy,
+        mcts_batch_size=8,
+        mcts_min_batches_per_search=4,
+        tactical_threshold=WIN_SCORE,
+    )
+
+    move, probs = player.get_action(board, temp=1.0, return_prob=1)
+
+    assert move in range(board.width * board.height)
+    assert abs(float(sum(probs)) - 1.0) < 1e-6
+    assert calls["batch_sizes"] == [2, 2, 2, 2]
+    assert player.effective_mcts_batch_size == 2
+    assert player.batched_policy_batches == 4
+    assert player.batched_policy_positions == 8
 
 
 def test_mcts_tactical_prior_can_bias_two_ply_root_threat():
@@ -328,6 +421,35 @@ def test_policy_value_fn_blends_shape_prior():
     prob_map = dict(probs)
 
     assert prob_map[13] > prob_map[0]
+
+
+def test_policy_value_fn_can_skip_shape_prior():
+    board = Board(width=5, height=5, n_in_row=4)
+    board.init_board()
+    _place(board, 12, 1)
+    board.current_player = 2
+
+    policy_value_net = PolicyValueNet(
+        5,
+        5,
+        use_gpu=False,
+        num_res_blocks=1,
+        num_filters=16,
+    )
+    calls = {"count": 0}
+
+    def forbidden_prior(_board):
+        calls["count"] += 1
+        raise AssertionError("heuristic prior should be skipped")
+
+    policy_value_net._heuristic_prior = forbidden_prior
+    probs, _value = policy_value_net.policy_value_fn(
+        board,
+        heuristic_prior_weight=0.0,
+    )
+
+    assert len(list(probs)) == len(board.availables)
+    assert calls["count"] == 0
 
 
 def test_conv_attention_policy_value_net_smoke():
@@ -1333,6 +1455,83 @@ def test_current_promotion_requires_elo_floor_check(tmp_path):
     )
 
     assert not has_current_promotion(checkpoint)
+
+
+def test_match_record_parallel_baseline_aggregates_results():
+    candidate = {
+        "id": "random",
+        "type": "baseline",
+        "name": "Random candidate",
+        "elo": 800,
+        "board_width": 3,
+        "board_height": 3,
+        "n_in_row": 3,
+        "metrics": {"config": {"eval_parallel_games": 2}},
+    }
+    opponent = {
+        "id": "random",
+        "type": "baseline",
+        "name": "Random opponent",
+        "elo": 800,
+        "board_width": 3,
+        "board_height": 3,
+        "n_in_row": 3,
+    }
+
+    record = _match_record(
+        candidate,
+        opponent,
+        games=4,
+        candidate_n_playout=1,
+        opponent_n_playout=1,
+    )
+
+    assert record["games"] == 4
+    assert record["parallel_workers"] == 2
+    assert record["duration_s"] >= 0
+    assert (
+        record["wins"]
+        + record["draws"]
+        + record["losses"]
+        + record["failures"]
+    ) == 4
+
+
+def test_match_record_handles_zero_games():
+    candidate = {
+        "id": "random",
+        "type": "baseline",
+        "name": "Random candidate",
+        "elo": 800,
+        "board_width": 3,
+        "board_height": 3,
+        "n_in_row": 3,
+        "metrics": {"config": {"eval_parallel_games": 2}},
+    }
+    opponent = {
+        "id": "random",
+        "type": "baseline",
+        "name": "Random opponent",
+        "elo": 800,
+        "board_width": 3,
+        "board_height": 3,
+        "n_in_row": 3,
+    }
+
+    record = _match_record(
+        candidate,
+        opponent,
+        games=0,
+        candidate_n_playout=1,
+        opponent_n_playout=1,
+    )
+
+    assert record["games"] == 0
+    assert record["score"] == 0.0
+    assert record["wins"] == 0
+    assert record["draws"] == 0
+    assert record["losses"] == 0
+    assert record["failures"] == 0
 
 
 def test_mcts_self_play_smoke():

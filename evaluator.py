@@ -1,4 +1,7 @@
 import copy
+import concurrent.futures
+import multiprocessing as mp
+import time
 import traceback
 from pathlib import Path
 
@@ -17,7 +20,7 @@ from mcts import MCTSPlayer
 from model import PolicyValueNet
 from players import HeuristicPlayer, RandomPlayer
 from tracking import append_training_event
-from train import TacticalBeamSelfPlayPlayer
+from train import TacticalBeamSelfPlayPlayer, _resolve_parallel_worker_count
 
 
 def _board_config(agent):
@@ -140,12 +143,30 @@ def _player_factory(agent, n_playout, eval_mode="mcts"):
         raise ValueError(f"Unsupported eval mode for checkpoint: {mode}")
     tactical_prior = _agent_mcts_tactical_prior(agent)
     tactical_leaf = _agent_mcts_tactical_leaf(agent)
+    config = _agent_config(agent)
+    mcts_heuristic_prior_weight = config.get("mcts_heuristic_prior_weight")
+
+    def policy_fn(board):
+        return policy.policy_value_fn(
+            board,
+            heuristic_prior_weight=mcts_heuristic_prior_weight,
+        )
+
+    def policy_batch_fn(boards):
+        return policy.policy_value_batch_fn(
+            boards,
+            heuristic_prior_weight=mcts_heuristic_prior_weight,
+        )
+
     return lambda _game_idx=0: MCTSPlayer(
-            policy.policy_value_fn,
+            policy_fn,
             c_puct=5,
             n_playout=n_playout,
             is_selfplay=0,
             use_parallel=False,
+            policy_value_batch_function=policy_batch_fn,
+            mcts_batch_size=config.get("mcts_batch_size", 1),
+            mcts_min_batches_per_search=config.get("mcts_min_batches_per_search", 1),
             tactical_threshold=_agent_mcts_tactical_threshold(agent),
             tactical_prior_weight=tactical_prior["weight"],
             tactical_prior_temperature=tactical_prior["temperature"],
@@ -165,6 +186,91 @@ def _player_factory(agent, n_playout, eval_mode="mcts"):
         )
 
 
+def _eval_parallel_workers(candidate, games):
+    config = _agent_config(candidate)
+    if games <= 1:
+        return 1
+    return _resolve_parallel_worker_count(
+        config,
+        key="eval_parallel_games",
+        prefix="eval",
+        limit=games,
+    )
+
+
+def _match_game_result(
+    candidate_factory,
+    opponent_factory,
+    board_config,
+    game_idx,
+):
+    board = Board(
+        width=board_config["board_width"],
+        height=board_config["board_height"],
+        n_in_row=board_config["n_in_row"],
+    )
+    game = Game(board)
+    candidate_player = candidate_factory(game_idx)
+    opponent_player = opponent_factory(game_idx)
+    try:
+        winner, moves = game.start_play(
+            candidate_player,
+            opponent_player,
+            start_player=game_idx % 2,
+            is_shown=0,
+        )
+        if winner == candidate_player.player:
+            outcome = "win"
+        elif winner == -1:
+            outcome = "draw"
+        else:
+            outcome = "loss"
+        return {
+            "game": game_idx + 1,
+            "outcome": outcome,
+            "moves": len(moves),
+        }
+    except Exception as exc:
+        return {
+            "game": game_idx + 1,
+            "outcome": "failure",
+            "error": str(exc),
+            "traceback": traceback.format_exc(limit=4),
+        }
+
+
+def _match_chunk(args):
+    (
+        candidate,
+        opponent,
+        game_indices,
+        candidate_n_playout,
+        opponent_n_playout,
+        candidate_eval_mode,
+        opponent_eval_mode,
+    ) = args
+    board_config = _board_config(candidate)
+    candidate_factory = _player_factory(candidate, candidate_n_playout, candidate_eval_mode)
+    opponent_factory = _player_factory(opponent, opponent_n_playout, opponent_eval_mode)
+    return [
+        _match_game_result(
+            candidate_factory,
+            opponent_factory,
+            board_config,
+            game_idx,
+        )
+        for game_idx in game_indices
+    ]
+
+
+def _match_chunks(games, workers):
+    return [
+        list(range(worker_idx, games, workers))
+        for worker_idx in range(workers)
+        if worker_idx < games
+    ]
+
+
 def _match_record(
     candidate,
     opponent,
@@ -174,41 +280,83 @@ def _match_record(
     candidate_eval_mode="mcts",
     opponent_eval_mode="mcts",
 ):
-    board_config = _board_config(candidate)
-    candidate_factory = _player_factory(candidate, candidate_n_playout, candidate_eval_mode)
-    opponent_factory = _player_factory(opponent, opponent_n_playout, opponent_eval_mode)
+    match_start = time.perf_counter()
+    workers = _eval_parallel_workers(candidate, games)
     wins = draws = losses = failures = 0
     failure_messages = []
+    move_counts = []
+    outcome_move_counts = {
+        "win": [],
+        "draw": [],
+        "loss": [],
+    }
 
-    for game_idx in range(games):
-        board = Board(
-            width=board_config["board_width"],
-            height=board_config["board_height"],
-            n_in_row=board_config["n_in_row"],
-        )
-        game = Game(board)
-        candidate_player = candidate_factory(game_idx)
-        opponent_player = opponent_factory(game_idx)
-        try:
-            winner, moves = game.start_play(
-                candidate_player,
-                opponent_player,
-                start_player=game_idx % 2,
-                is_shown=0,
+    chunks = _match_chunks(games, workers)
+    if not chunks:
+        result_groups = []
+    elif workers == 1:
+        result_groups = [
+            _match_chunk(
+                (
+                    candidate,
+                    opponent,
+                    chunks[0],
+                    candidate_n_playout,
+                    opponent_n_playout,
+                    candidate_eval_mode,
+                    opponent_eval_mode,
+                )
             )
-            if winner == candidate_player.player:
+        ]
+    else:
+        worker_args = [
+            (
+                candidate,
+                opponent,
+                chunk,
+                candidate_n_playout,
+                opponent_n_playout,
+                candidate_eval_mode,
+                opponent_eval_mode,
+            )
+            for chunk in chunks
+        ]
+        executor_kwargs = {"max_workers": workers}
+        start_methods = mp.get_all_start_methods()
+        for method in ("forkserver", "spawn", "fork"):
+            if method in start_methods:
+                executor_kwargs["mp_context"] = mp.get_context(method)
+                break
+        with concurrent.futures.ProcessPoolExecutor(**executor_kwargs) as executor:
+            result_groups = list(executor.map(_match_chunk, worker_args))
+
+    for results in result_groups:
+        for result in results:
+            outcome = result.get("outcome")
+            if outcome == "win":
                 wins += 1
-            elif winner == -1:
+                outcome_move_counts["win"].append(result.get("moves", 0))
+            elif outcome == "draw":
                 draws += 1
-            else:
+                outcome_move_counts["draw"].append(result.get("moves", 0))
+            elif outcome == "loss":
                 losses += 1
-        except Exception as exc:
-            failures += 1
-            failure_messages.append({
-                "game": game_idx + 1,
-                "error": str(exc),
-                "traceback": traceback.format_exc(limit=4),
-            })
+                outcome_move_counts["loss"].append(result.get("moves", 0))
+            else:
+                failures += 1
+                failure_messages.append({
+                    "game": result.get("game"),
+                    "error": result.get("error"),
+                    "traceback": result.get("traceback"),
+                })
+            if outcome in outcome_move_counts:
+                move_counts.append(result.get("moves", 0))
+
+    def average(values):
+        values = [int(value or 0) for value in values]
+        if not values:
+            return None
+        return round(sum(values) / len(values), 3)
 
     return {
         "opponent_id": opponent["id"],
@@ -221,6 +369,12 @@ def _match_record(
         "score": score_from_record(wins, draws, losses),
         "failures": failures,
         "failure_messages": failure_messages[:3],
+        "duration_s": round(time.perf_counter() - match_start, 3),
+        "parallel_workers": workers,
+        "avg_moves": average(move_counts),
+        "win_avg_moves": average(outcome_move_counts["win"]),
+        "draw_avg_moves": average(outcome_move_counts["draw"]),
+        "loss_avg_moves": average(outcome_move_counts["loss"]),
     }
 
 
@@ -287,6 +441,7 @@ def evaluate_checkpoint(
     promote=True,
     gate=None,
 ):
+    eval_start = time.perf_counter()
     candidate = find_agent(agent_id, registry_path)
     if candidate is None:
         raise ValueError(f"Unknown checkpoint '{agent_id}'")
@@ -296,28 +451,93 @@ def evaluate_checkpoint(
     gate = copy.deepcopy(gate or COMPLETION_GATE)
     previous_best_games = games if previous_best_games is None else previous_best_games
     n_playout = candidate.get("n_playout", 2) if n_playout is None else n_playout
-    baseline_opponent_n_playout = n_playout if opponent_n_playout is None else opponent_n_playout
+    checkpoint_opponent_override = n_playout if opponent_n_playout is None else opponent_n_playout
+    baseline_opponent_n_playout = 0
+    checkpoint_dir = Path(registry_path).parent
+    opponents = {}
 
-    opponents = {
-        "random": _match_record(
+    def run_opponent(
+        opponent_key,
+        opponent,
+        opponent_games,
+        candidate_n_playout,
+        current_opponent_n_playout,
+        candidate_eval_mode="mcts",
+        current_opponent_eval_mode="mcts",
+    ):
+        parallel_workers = _eval_parallel_workers(candidate, opponent_games)
+        common_fields = {
+            "preset": candidate.get("preset"),
+            "checkpoint_id": candidate["id"],
+            "games_trained": candidate.get("games_trained"),
+            "opponent_key": opponent_key,
+            "opponent_id": opponent["id"],
+            "opponent_name": opponent.get("name", opponent["id"]),
+            "opponent_elo": opponent.get("elo", 1000),
+            "games": opponent_games,
+            "n_playout": candidate_n_playout,
+            "opponent_n_playout": current_opponent_n_playout,
+            "eval_mode": candidate_eval_mode,
+            "opponent_eval_mode": current_opponent_eval_mode,
+            "parallel_workers": parallel_workers,
+        }
+        append_training_event(
+            {
+                "event": "evaluation_opponent_start",
+                **common_fields,
+                "evaluation_elapsed_s": round(time.perf_counter() - eval_start, 3),
+            },
+            checkpoint_dir=checkpoint_dir,
+        )
+        record = _match_record(
             candidate,
-            _baseline_agent("random", candidate),
-            games,
-            n_playout,
-            baseline_opponent_n_playout,
-            candidate_eval_mode=eval_mode,
-            opponent_eval_mode="mcts",
-        ),
-        "heuristic": _match_record(
-            candidate,
-            _baseline_agent("heuristic", candidate),
-            games,
-            n_playout,
-            baseline_opponent_n_playout,
-            candidate_eval_mode=eval_mode,
-            opponent_eval_mode="mcts",
-        ),
-    }
+            opponent,
+            opponent_games,
+            candidate_n_playout,
+            current_opponent_n_playout,
+            candidate_eval_mode=candidate_eval_mode,
+            opponent_eval_mode=current_opponent_eval_mode,
+        )
+        append_training_event(
+            {
+                "event": "evaluation_opponent",
+                **common_fields,
+                "wins": record["wins"],
+                "draws": record["draws"],
+                "losses": record["losses"],
+                "score": record["score"],
+                "failures": record["failures"],
+                "failure_messages": record.get("failure_messages", []),
+                "duration_s": record["duration_s"],
+                "avg_moves": record.get("avg_moves"),
+                "win_avg_moves": record.get("win_avg_moves"),
+                "draw_avg_moves": record.get("draw_avg_moves"),
+                "loss_avg_moves": record.get("loss_avg_moves"),
+                "evaluation_elapsed_s": round(time.perf_counter() - eval_start, 3),
+                "opponents_completed": len(opponents) + 1,
+            },
+            checkpoint_dir=checkpoint_dir,
+        )
+        return record
+
+    opponents["random"] = run_opponent(
+        "random",
+        _baseline_agent("random", candidate),
+        games,
+        n_playout,
+        baseline_opponent_n_playout,
+        candidate_eval_mode=eval_mode,
+        current_opponent_eval_mode="random",
+    )
+    opponents["heuristic"] = run_opponent(
+        "heuristic",
+        _baseline_agent("heuristic", candidate),
+        games,
+        n_playout,
+        baseline_opponent_n_playout,
+        candidate_eval_mode=eval_mode,
+        current_opponent_eval_mode="heuristic",
+    )
 
     champion = champion_checkpoint(candidate, registry_path, exclude_id=candidate["id"])
     champion_elo = None if champion is None else champion.get("elo", 0)
@@ -327,14 +547,14 @@ def evaluate_checkpoint(
         else (None if champion is None else champion.get("n_playout", n_playout))
     )
     if champion is not None:
-        opponents["previous_best"] = _match_record(
-            candidate,
+        opponents["previous_best"] = run_opponent(
+            "previous_best",
             champion,
             previous_best_games,
             n_playout,
             checkpoint_opponent_n_playout,
             candidate_eval_mode=eval_mode,
-            opponent_eval_mode=opponent_eval_mode,
+            current_opponent_eval_mode=opponent_eval_mode,
         )
         opponents["previous_best"]["opponent_id"] = champion["id"]
         opponents["previous_best"]["opponent_name"] = champion.get("name", champion["id"])
@@ -357,6 +577,7 @@ def evaluate_checkpoint(
         "opponent_n_playout": {
             "baseline": baseline_opponent_n_playout,
             "previous_best": checkpoint_opponent_n_playout,
+            "checkpoint_override": checkpoint_opponent_override,
         },
     }
     gate_result = _gate_result(candidate, evaluation, gate)
@@ -469,9 +690,11 @@ def evaluate_checkpoint(
             "event": "evaluation",
             "preset": candidate.get("preset"),
             "checkpoint_id": candidate["id"],
+            "games_trained": candidate.get("games_trained"),
             "elo": estimated_elo,
             "games": games,
             "previous_best_games": previous_best_games,
+            "duration_s": round(time.perf_counter() - eval_start, 3),
             "evaluation": evaluation,
             "promotion": promotion,
             "promote": bool(promote),

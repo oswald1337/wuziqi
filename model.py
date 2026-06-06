@@ -1,3 +1,13 @@
+import os
+
+for _thread_env in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env, "1")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -219,7 +229,27 @@ class PolicyValueNet:
             return np.full(len(legal_positions), 1.0 / len(legal_positions))
         return scores / scores_sum
 
-    def policy_value_fn(self, board):
+    def _legal_policy_probs(self, board, act_probs, heuristic_prior_weight=None):
+        legal_positions = board.availables
+        legal_probs = act_probs[legal_positions]
+        if heuristic_prior_weight is None:
+            heuristic_prior_weight = HEURISTIC_PRIOR_WEIGHT
+        heuristic_prior_weight = max(0.0, min(1.0, float(heuristic_prior_weight)))
+        legal_probs_sum = np.sum(legal_probs)
+        if legal_probs_sum > 0:
+            legal_probs = legal_probs / legal_probs_sum
+        if heuristic_prior_weight <= 0.0:
+            return legal_probs
+
+        prior = self._heuristic_prior(board)
+        if len(prior) == len(legal_probs):
+            legal_probs = (
+                (1.0 - heuristic_prior_weight) * legal_probs
+                + heuristic_prior_weight * prior
+            )
+        return legal_probs
+
+    def policy_value_fn(self, board, heuristic_prior_weight=None):
         """
         input: board
         output: a list of (action, probability) tuples for each available
@@ -242,19 +272,37 @@ class PolicyValueNet:
                 act_probs = np.exp(log_act_probs.data.numpy().flatten())
                 value = value.data.numpy()[0][0]
             
-        legal_probs = act_probs[legal_positions]
-        prior = self._heuristic_prior(board)
-        if len(prior) == len(legal_probs):
-            legal_probs_sum = np.sum(legal_probs)
-            if legal_probs_sum > 0:
-                legal_probs = legal_probs / legal_probs_sum
-            legal_probs = (
-                (1.0 - HEURISTIC_PRIOR_WEIGHT) * legal_probs
-                + HEURISTIC_PRIOR_WEIGHT * prior
-            )
+        legal_probs = self._legal_policy_probs(
+            board,
+            act_probs,
+            heuristic_prior_weight=heuristic_prior_weight,
+        )
 
         act_probs = zip(legal_positions, legal_probs)
         return act_probs, value
+
+    def policy_value_batch_fn(self, boards, heuristic_prior_weight=None):
+        """
+        Batched version of policy_value_fn for MCTS leaf parallelism.
+        """
+        boards = list(boards)
+        if not boards:
+            return []
+
+        states = np.ascontiguousarray([
+            board.current_state() for board in boards
+        ])
+        act_probs_batch, values = self.policy_value(states)
+        results = []
+        for idx, board in enumerate(boards):
+            legal_positions = board.availables
+            legal_probs = self._legal_policy_probs(
+                board,
+                act_probs_batch[idx],
+                heuristic_prior_weight=heuristic_prior_weight,
+            )
+            results.append((zip(legal_positions, legal_probs), float(values[idx][0])))
+        return results
 
     def policy_value(self, state_batch):
         """
@@ -264,12 +312,18 @@ class PolicyValueNet:
         self.policy_value_net.eval()
         with torch.no_grad():
             if self.use_gpu:
-                state_batch = torch.FloatTensor(np.array(state_batch)).to(self.device)
+                state_array = np.asarray(state_batch, dtype=np.float32)
+                state_batch = torch.as_tensor(
+                    state_array,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
                 log_act_probs, value = self.policy_value_net(state_batch)
                 act_probs = np.exp(log_act_probs.data.cpu().numpy())
                 return act_probs, value.data.cpu().numpy()
             else:
-                state_batch = torch.FloatTensor(np.array(state_batch))
+                state_array = np.asarray(state_batch, dtype=np.float32)
+                state_batch = torch.as_tensor(state_array, dtype=torch.float32)
                 log_act_probs, value = self.policy_value_net(state_batch)
                 act_probs = np.exp(log_act_probs.data.numpy())
                 return act_probs, value.data.numpy()
@@ -286,9 +340,21 @@ class PolicyValueNet:
         """perform a training step"""
         # wrap in Variable
         if self.use_gpu:
-            state_batch = torch.FloatTensor(np.array(state_batch)).to(self.device)
-            mcts_probs = torch.FloatTensor(np.array(mcts_probs)).to(self.device)
-            winner_batch = torch.FloatTensor(np.array(winner_batch)).to(self.device)
+            state_batch = torch.as_tensor(
+                np.asarray(state_batch, dtype=np.float32),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            mcts_probs = torch.as_tensor(
+                np.asarray(mcts_probs, dtype=np.float32),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            winner_batch = torch.as_tensor(
+                np.asarray(winner_batch, dtype=np.float32),
+                dtype=torch.float32,
+                device=self.device,
+            )
         else:
             state_batch = torch.FloatTensor(np.array(state_batch))
             mcts_probs = torch.FloatTensor(np.array(mcts_probs))

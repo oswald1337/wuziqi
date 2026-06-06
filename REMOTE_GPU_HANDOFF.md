@@ -18,6 +18,63 @@ Local Apple Silicon runs are for finding a good starting point:
 Remote GPU runs should scale a documented local recipe instead of repeating
 small smoke presets.
 
+## Final Server Wrap, 2026-06-06
+
+The rented GPU server was wrapped before expiry after the MVP run and one
+focused efficiency pass.
+
+- Final health check passed. PyTorch CUDA reported one NVIDIA GeForce RTX 4060,
+  `nvidia-smi` worked, TensorBoard HTTP returned 200, required training and
+  resource TensorBoard tags were present, and the top-human preset resolved to
+  12 self-play workers plus 12 eval workers on the current 11.52-core cgroup
+  quota.
+- TensorBoard was running remotely on port `8081`; view it later with local
+  port forwarding to `8080`:
+
+```bash
+ssh -i ~/.ssh/vast -p 59644 root@74.48.140.178 -L 8080:localhost:8081
+```
+
+- At wrap time there was no active training tmux session. GPU utilization was
+  0%, memory use was 0 MiB, and only monitor/dashboard sessions remained.
+- The full MVP checkpoint
+  `large_16x16_top_human_gpu_final_g524_20260606_014356_758050` failed
+  promotion and should not replace the champion seed.
+- The last smoke checkpoint
+  `large_16x16_top_human_gpu_final_g24_20260606_171202_292769` only validated
+  compact request instrumentation; it also failed promotion and is not a seed.
+- Source code, tests, and docs should be enough to resume development from
+  git. Exact training continuation still needs ignored runtime artifacts from
+  `checkpoints/`: seed model, optimizer state, registry, useful replay pickle,
+  `training_log.jsonl`, and TensorBoard events. The directory was about 1.9 GB
+  at wrap time.
+
+Efficiency evidence from the final compact-request smoke:
+
+- Self-play: 12 games, 915 moves, about 6.37 moves/sec, 802 search moves, no
+  self-play draws.
+- Loss deltas over the smoke: total -0.281, policy -0.234, value -0.047,
+  entropy -0.091. That is only a short mechanical signal, not convergence
+  proof.
+- Runtime: stream elapsed 143.7s, worker search-time sum 1245.3s, worker wait
+  57.9s, coalescing 8.8s, payload build 10.7s, training 8.3s, eval 20.6s,
+  checkpoint 8.9s, replay save 5.5s, JSONL/TensorBoard logging below 1s.
+- Compact response cut response construction from roughly 9.1s to about 1.3s
+  in the packed-response smoke; compact request then reduced request payload
+  build to 10.7s and response send to 4.1s. This is useful, but worker wait and
+  search cadence still dominate.
+- Compact requests sent `uint8` state tensors at 1024 bytes/position on 16x16
+  boards plus flattened legal move indexes. Compact responses sent flat
+  probability/value arrays and avoided parent-side action/probability lists.
+- The best current diagnosis is still MCTS/search-coordination-bound rather
+  than model-training-bound. GPU utilization is bursty, CPU quota is not fully
+  saturated by useful work, and training/logging are comparatively small.
+
+Next development step: optimize MCTS request cadence, coalescing, and batched
+inference/search scheduling before trying another heuristic branch. Only after
+the search path is using CPU/GPU efficiently should the next long run compare
+target-sharpening or value/draw changes.
+
 ## Current Local Artifacts
 
 Copy these to the remote server before a serious run:
@@ -305,11 +362,88 @@ Run the dashboard on the remote server and forward the port locally:
 .venv/bin/python main.py --mode web --host 0.0.0.0 --port 8000
 ```
 
-Run TensorBoard for scalar monitoring:
+Run TensorBoard for scalar monitoring on the current remote GPU box:
 
 ```bash
-.venv/bin/tensorboard --logdir checkpoints/tensorboard --port 6006
+.venv/bin/tensorboard --logdir checkpoints/tensorboard --host 0.0.0.0 --port 8081
 ```
+
+View it locally by forwarding local port `8080` to remote `8081`:
+
+```bash
+ssh -i ~/.ssh/vast -p 59644 root@74.48.140.178 -L 8080:localhost:8081
+```
+
+Run the lightweight resource monitor beside long GPU jobs:
+
+```bash
+.venv/bin/python resource_monitor.py --output resource_monitor.jsonl --interval 30
+```
+
+Before starting a long run, use the one-command preflight:
+
+```bash
+.venv/bin/python remote_health_check.py --preset large_16x16_top_human_gpu --eval-games 32
+```
+
+It checks tmux monitor sessions, TensorBoard HTTP, training/resource
+TensorBoard scalar coverage, fresh resource JSONL, `nvidia-smi`, PyTorch CUDA,
+and the resolved self-play/eval worker counts for the preset.
+
+`resource_monitor.py` is cgroup-aware. In `resource_monitor.jsonl`,
+`cpu_util_percent` measures the training container against its allocated CPU
+quota, while `host_cpu_util_percent` is host-wide pressure and can include
+other workloads. The `large_16x16_top_human_gpu` preset uses auto parallelism
+for self-play and evaluation, capped to the usable cgroup CPU worker count by
+default. The monitor also mirrors CPU/GPU resource scalars into
+`checkpoints/tensorboard/resource_monitor` unless started with
+`--no-tensorboard`.
+
+The resource monitor was started after the 2026-06-06 MVP run, so that run's
+CPU/GPU resource evidence still comes from training JSONL plus `gpu_smi.log`.
+For the next long run, leave `resource_monitor.py` running through an idle
+baseline window and the full training/evaluation window, then pass
+`--resource-log resource_monitor.jsonl` and
+`--replay-path checkpoints/replay_16x16_n5_r4_f64.pkl` to
+`training_audit.py`.
+
+Before changing the MCTS target recipe, audit replay quality:
+
+```bash
+.venv/bin/python replay_audit.py checkpoints/replay_16x16_n5_r4_f64.pkl --max-samples 50000 --strategy tail
+```
+
+Before training a target-sharpening rewrite, compare candidate transforms on
+the same replay slice without changing trainer behavior:
+
+```bash
+.venv/bin/python replay_audit.py checkpoints/replay_16x16_n5_r4_f64.pkl --max-samples 50000 --strategy tail --probe-transforms
+```
+
+The 2026-06-06 MVP replay tail classified as `diffuse_policy_targets`: 0.0%
+draw labels, about 50/50 positive/negative value labels, 84.0% of policy
+targets with max probability <= 0.02, and only 13.8% with max probability >=
+0.25. That supports fixing search target sharpness/alignment before another
+long heuristic experiment.
+The transform probe reports retained MCTS mass, support size, top-1 agreement,
+max-prob/entropy deltas, and target distortion metrics for power, top-k,
+min-prob, top-k+power, and top-1 candidates. Use smaller `--max-samples`
+values for quick checks; the 50k source-of-truth replay tail can take a few
+minutes because the replay pickle is large.
+The selected focused rewrite for the next run is top-k-16 self-play target
+sharpening: `self_play_target_transform=top_k` and
+`self_play_target_top_k=16` in `large_16x16_top_human_gpu`. The 50k replay
+probe showed this raises mean policy max probability from about 0.147 to
+0.207, drops normalized entropy by about 0.366, preserves the search top move,
+and retains about 24.8% of original MCTS target mass before renormalization.
+Future self-play JSONL/TensorBoard events include transform retained mass,
+support kept, top-1 change rate, max-prob delta, and normalized-entropy delta.
+The integrated run audit now reports
+`decision_recommendation.label=fix_search_target_alignment_before_scaling` for
+the MVP artifacts.
+Runs started after this instrumentation also write
+`self_play/policy_target_*` and `self_play/value_target_*` scalars directly to
+JSONL/TensorBoard, so target diffusion should be visible during the run.
 
 ## Experiment Notes
 
@@ -351,6 +485,7 @@ Use this table for serious local or remote experiments.
 | 2026-06-04 | `large_16x16_attention_two_ply_leaf_mcts` | Attempted proof-aware MCTS leaf values for bounded two-ply threats, with reason-level leaf counters. | Aborted locally before final checkpoint; champion remains `large_16x16_attention_mcts_draw_penalty_final_g12_20260604_082155_525442`. | A 10-position independent full-reply diagnostic showed generated threat-space labels are semantically strong: all 10 sampled targets survived all 251 legal replies. However, enabling two-ply proof checks inside every distillation MCTS leaf stalled for several minutes before any distillation event, so the run was stopped as locally impractical. | Do not put bounded two-ply proof checks inside every leaf on the local M5 path. Use cheaper root-only proof hints, cached proof labels, or a separate threat-space auxiliary model instead. |
 | 2026-06-04 | `large_16x16_attention_two_ply_prior_mcts` | Added a cheap bounded two-ply root-prior bonus to MCTS plus TensorBoard scalar `self_play/tactical_prior_two_ply_hits`. This branch kept source-aware distillation and avoided per-leaf two-ply proof checks. | Rejected; champion remains `large_16x16_attention_mcts_draw_penalty_final_g12_20260604_082155_525442`. | The root prior solved the distillation visibility problem: threat-space search target mass rose from 0.0296 in the balanced branch to 0.9243, with 93.75% threat-space search top-rate. Self-play was 7 decisive games plus 1 draw, with 400 prior searches and 3 two-ply prior hits. Fixed evaluation still regressed: built-in eval was Elo 1023 with 43.75% vs heuristic, and the 4-game no-promote probe scored Elo 1015, 37.5% vs heuristic, 37.5% vs previous best, zero failures, and no promotion. | Root-only proof hints are cheap and make threat-space labels visible to search, but they do not yet improve fixed play. Next work should avoid adding more tactical priors and instead calibrate value/promotion around these proofs: e.g. separate threat-space value head, proof-labeled evaluation positions, or longer training only after a small probe improves previous-best score. |
 | 2026-06-05 | `large_16x16_attention_threat_value_calibration` | Added proof-path value-only training for bounded two-ply threats. Each generated proof contributes root value targets, defender-to-move losing states after the threat, and attacker follow-up states after plausible replies. TensorBoard logs these under `proof_value/*`. | Reclassified after promotion tightening; current local seed remains `large_16x16_attention_mcts_draw_penalty_final_g12_20260604_082155_525442`, Elo 1134. Candidate checkpoint: `large_16x16_attention_threat_value_calibration_final_g20_20260605_073525_079490`. Completion gate remains false. | Proof-value bootstrap generated 750 samples from 128 positions: 125 root states, 125 defender states, 500 follow-up states, and 3 skipped positions. Distillation stayed aligned: overall search target mass 0.9486, threat-space search mass 0.9083, and threat-space top-rate 91.67%. Self-play was 6 decisive games plus 2 draws. Built-in eval was draw-heavy at Elo 1039 with 8/8 draws vs heuristic. Earlier 4-game and 8-game probes showed noisy head-to-head promise, but the stricter re-probe scored Elo 1061, 50.0% vs heuristic, 62.5% vs previous best, zero failures, and failed the new Elo floor by -73 versus the champion. | Proof-path value calibration is useful telemetry but not a remote seed. Promotion now requires at least 16 heuristic games, at least 16 previous-best games, and no fixed-baseline Elo regression. Next work should repeat proof-value calibration only inside a larger 16+ game confidence gate, or use it as auxiliary value data while preserving the 1134-Elo draw-penalty champion as the seed. |
+| 2026-06-06 | `large_16x16_top_human_gpu` MVP remote run | Ran the requested remote GPU command from the draw-penalty champion seed with 512 MCTS self-play games, JSONL/TensorBoard runtime instrumentation, GPU inference batching, and parallel self-play workers. After the failed run, added one focused evaluator efficiency rewrite: `eval_parallel_games` plus chunked parallel external evaluation records, and repaired/preserved the eval worker setting in checkpoint metadata. | Rejected; champion remains `large_16x16_attention_mcts_draw_penalty_final_g12_20260604_082155_525442`. Candidate checkpoint: `large_16x16_top_human_gpu_final_g524_20260606_014356_758050`. | Self-play completed 512/512 games with 35,388 moves, zero draws, and zero eval failures. Throughput was about 3.24 self-play moves/sec and 2.80 search moves/sec. GPU batching worked with median about 497.5 positions/batch, but `gpu_smi.log` over the run window had 304 samples with 83.6% idle, 0% median utilization, and 91% max burst; CPU use stayed far below all-core saturation, so self-play was MCTS/search-coordination-bound. Internal eval was Elo 454 with 3.125% vs heuristic; external eval was Elo 684 with 21.875% vs heuristic and 9.375% vs previous best. Replay inspection found balanced decisive value labels but diffuse policy targets: about 84% of sampled targets had max probability <= 0.02. External eval took 5796.9s serially on CPU before the rewrite. | Do not continue this recipe longer. Next remote work should use the parallel evaluator, then address search/target alignment before scaling: sharpen or filter MCTS policy targets, reduce duplicate serial eval, and optimize search/request cadence before trying new heuristics. |
 
 ## Things To Investigate
 

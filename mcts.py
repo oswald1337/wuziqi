@@ -1,7 +1,9 @@
 import numpy as np
 import copy
+import math
 import torch
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from tactical import (
     TACTICAL_FORCE_THRESHOLD,
@@ -12,6 +14,14 @@ from tactical import (
     ranked_tactical_moves,
     winning_moves,
 )
+
+
+def _copy_board(board):
+    copier = getattr(board, "copy", None)
+    if callable(copier):
+        return copier()
+    return copy.deepcopy(board)
+
 
 def softmax(x):
     probs = np.exp(x - np.max(x))
@@ -184,8 +194,21 @@ class TreeNode:
         plus bonus u(P).
         Return: A tuple of (action, next_node)
         """
-        return max(self.children.items(),
-                   key=lambda act_node: act_node[1].get_value(c_puct))
+        parent_scale = math.sqrt(self.n_visits + self.virtual_loss)
+        best_action = None
+        best_node = None
+        best_value = -float("inf")
+        for action, node in self.children.items():
+            node.u = (
+                c_puct * node.P * parent_scale
+                / (1 + node.n_visits + node.virtual_loss)
+            )
+            value = node.Q - node.virtual_loss + node.u
+            if value > best_value:
+                best_action = action
+                best_node = node
+                best_value = value
+        return best_action, best_node
 
     def get_value(self, c_puct):
         """Calculate and return the value for this node.
@@ -195,7 +218,7 @@ class TreeNode:
         value Q, and prior probability P, on this node's score.
         """
         self.u = (c_puct * self.P *
-                  np.sqrt(self.parent.n_visits + self.parent.virtual_loss) / (1 + self.n_visits + self.virtual_loss))
+                  math.sqrt(self.parent.n_visits + self.parent.virtual_loss) / (1 + self.n_visits + self.virtual_loss))
         return self.Q - self.virtual_loss + self.u
 
     def apply_virtual_loss(self):
@@ -239,6 +262,7 @@ class MCTS:
         policy_value_fn,
         c_puct=5,
         n_playout=10000,
+        policy_value_batch_fn=None,
         tactical_prior_weight=0.0,
         tactical_prior_temperature=1.0,
         tactical_prior_two_ply_bonus=0.0,
@@ -265,6 +289,7 @@ class MCTS:
         """
         self._root = TreeNode(None, 1.0)
         self._policy = policy_value_fn
+        self._policy_batch = policy_value_batch_fn
         self._c_puct = c_puct
         self._n_playout = n_playout
         self._tactical_prior_weight = max(0.0, min(1.0, float(tactical_prior_weight)))
@@ -288,6 +313,8 @@ class MCTS:
         self.tactical_leaf_positive = 0
         self.tactical_leaf_negative = 0
         self.tactical_leaf_reasons = {}
+        self.batched_policy_batches = 0
+        self.batched_policy_positions = 0
 
     def _root_action_priors(self, board, node, action_probs):
         if self._tactical_prior_weight <= 0.0 or not node.is_root():
@@ -350,10 +377,95 @@ class MCTS:
         # if we want to enforce it.
         # For now, let's keep this sequential and add a parallel version.
         for _ in range(self._n_playout):
-            state_copy = copy.deepcopy(board)
+            state_copy = _copy_board(board)
             self._playout(state_copy)
 
         # calc the move probabilities based on visit counts at the root node
+        act_visits = [(act, node.n_visits)
+                      for act, node in self._root.children.items()]
+        acts, visits = zip(*act_visits)
+        act_probs = softmax(1.0/temp * np.log(np.array(visits) + 1e-10))
+
+        return acts, act_probs
+
+    def _select_leaf(self, board, apply_virtual_loss=False):
+        node = self._root
+        virtual_loss_nodes = []
+        while not node.is_leaf():
+            action, node = node.select(self._c_puct)
+            if apply_virtual_loss:
+                node.apply_virtual_loss()
+                virtual_loss_nodes.append(node)
+            board.do_move(action)
+        return node, virtual_loss_nodes
+
+    def _terminal_leaf_value(self, board, winner):
+        if winner == -1:
+            return 0.0
+        return 1.0 if winner == board.get_current_player() else -1.0
+
+    def _finish_playout(self, node, board, action_probs, leaf_value, virtual_loss_nodes):
+        end, winner = board.game_end()
+        if not end:
+            tactical_value, _reason = self._tactical_leaf_value(board)
+            if tactical_value is not None:
+                leaf_value = tactical_value
+            action_probs = self._root_action_priors(board, node, action_probs)
+            node.expand(action_probs)
+        else:
+            leaf_value = self._terminal_leaf_value(board, winner)
+
+        for virtual_node in virtual_loss_nodes:
+            virtual_node.remove_virtual_loss()
+        node.update_recursive(-leaf_value)
+
+    def get_move_probs_batched(self, board, temp=1e-3, batch_size=16):
+        """Run MCTS with batched neural leaf evaluation."""
+        batch_size = max(1, int(batch_size))
+        playouts_done = 0
+        if self._root.is_leaf() and self._n_playout > 0:
+            self._playout(_copy_board(board))
+            playouts_done = 1
+
+        while playouts_done < self._n_playout:
+            records = []
+            for _ in range(min(batch_size, self._n_playout - playouts_done)):
+                state_copy = _copy_board(board)
+                node, virtual_loss_nodes = self._select_leaf(
+                    state_copy,
+                    apply_virtual_loss=True,
+                )
+                end, winner = state_copy.game_end()
+                if end:
+                    leaf_value = self._terminal_leaf_value(state_copy, winner)
+                    for virtual_node in virtual_loss_nodes:
+                        virtual_node.remove_virtual_loss()
+                    node.update_recursive(-leaf_value)
+                    playouts_done += 1
+                    continue
+                records.append((node, virtual_loss_nodes, state_copy))
+                playouts_done += 1
+
+            if not records:
+                continue
+
+            boards = [record[2] for record in records]
+            if self._policy_batch is None:
+                evaluations = [self._policy(leaf_board) for leaf_board in boards]
+            else:
+                evaluations = self._policy_batch(boards)
+                self.batched_policy_batches += 1
+                self.batched_policy_positions += len(boards)
+
+            for (node, virtual_loss_nodes, leaf_board), (action_probs, leaf_value) in zip(records, evaluations):
+                self._finish_playout(
+                    node,
+                    leaf_board,
+                    action_probs,
+                    leaf_value,
+                    virtual_loss_nodes,
+                )
+
         act_visits = [(act, node.n_visits)
                       for act, node in self._root.children.items()]
         acts, visits = zip(*act_visits)
@@ -366,7 +478,7 @@ class MCTS:
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = []
             for _ in range(self._n_playout):
-                state_copy = copy.deepcopy(board)
+                state_copy = _copy_board(board)
                 futures.append(executor.submit(self._playout_parallel, state_copy))
             
             # Wait for all to complete
@@ -488,6 +600,9 @@ class MCTSPlayer(object):
         n_playout=2000,
         is_selfplay=0,
         use_parallel=True,
+        policy_value_batch_function=None,
+        mcts_batch_size=1,
+        mcts_min_batches_per_search=1,
         tactical_threshold=TACTICAL_FORCE_THRESHOLD,
         two_ply_threats=False,
         two_ply_max_candidates=16,
@@ -516,6 +631,7 @@ class MCTSPlayer(object):
             policy_value_function,
             c_puct,
             n_playout,
+            policy_value_batch_fn=policy_value_batch_function,
             tactical_prior_weight=tactical_prior_weight,
             tactical_prior_temperature=tactical_prior_temperature,
             tactical_prior_two_ply_bonus=tactical_prior_two_ply_bonus,
@@ -534,6 +650,9 @@ class MCTSPlayer(object):
         )
         self._is_selfplay = is_selfplay
         self.use_parallel = use_parallel
+        self.mcts_batch_size = max(1, int(mcts_batch_size or 1))
+        self.mcts_min_batches_per_search = max(1, int(mcts_min_batches_per_search or 1))
+        self.effective_mcts_batch_size = self.mcts_batch_size
         self.tactical_threshold = (
             TACTICAL_FORCE_THRESHOLD
             if tactical_threshold is None
@@ -558,6 +677,7 @@ class MCTSPlayer(object):
         self.threat_solver_moves = 0
         self.two_ply_threat_moves = 0
         self.search_moves = 0
+        self.search_duration_s = 0.0
         self.selfplay_moves = 0
         self.dirichlet_noise_moves = 0
         self.no_noise_moves = 0
@@ -583,6 +703,24 @@ class MCTSPlayer(object):
     @property
     def tactical_leaf_reasons(self):
         return dict(self.mcts.tactical_leaf_reasons)
+
+    @property
+    def batched_policy_batches(self):
+        return self.mcts.batched_policy_batches
+
+    @property
+    def batched_policy_positions(self):
+        return self.mcts.batched_policy_positions
+
+    def _effective_mcts_batch_size(self):
+        batch_size = self.mcts_batch_size
+        if batch_size <= 1 or self.mcts_min_batches_per_search <= 1:
+            return batch_size
+        remaining_playouts = max(1, self.mcts._n_playout - 1)
+        max_batch_size = math.ceil(
+            remaining_playouts / self.mcts_min_batches_per_search
+        )
+        return max(1, min(batch_size, max_batch_size))
 
     def set_player_ind(self, p):
         self.player = p
@@ -628,10 +766,20 @@ class MCTSPlayer(object):
                     return forced_move, move_probs
                 return forced_move
 
-            if self.use_parallel:
+            search_start = time.perf_counter()
+            effective_batch_size = self._effective_mcts_batch_size()
+            self.effective_mcts_batch_size = effective_batch_size
+            if effective_batch_size > 1:
+                acts, probs = self.mcts.get_move_probs_batched(
+                    board,
+                    temp,
+                    batch_size=effective_batch_size,
+                )
+            elif self.use_parallel:
                 acts, probs = self.mcts.get_move_probs_parallel(board, temp)
             else:
                 acts, probs = self.mcts.get_move_probs(board, temp)
+            self.search_duration_s += time.perf_counter() - search_start
             self.search_moves += 1
             if self.tactical_prior_weight > 0.0:
                 self.tactical_prior_searches += 1

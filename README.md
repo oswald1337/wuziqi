@@ -48,9 +48,88 @@ For readable scalar charts during long runs:
 .venv/bin/tensorboard --logdir checkpoints/tensorboard --port 6006
 ```
 
+On the current remote GPU box, TensorBoard is kept on remote port `8081` so it
+can be viewed locally at `http://localhost:8080` with:
+
+```bash
+ssh -i ~/.ssh/vast -p 59644 root@74.48.140.178 -L 8080:localhost:8081
+```
+
 TensorBoard is the default local tracking backend. W&B remains optional for
 remote/server runs; `checkpoints/training_log.jsonl` remains the source of
 truth and is mirrored into TensorBoard scalars.
+
+For a JSON summary of one run's efficiency and evaluation metrics:
+
+```bash
+.venv/bin/python training_audit.py --log checkpoints/training_log.jsonl --preset large_16x16_top_human_gpu --checkpoint-id CHECKPOINT_ID --gpu-log gpu_smi.log --resource-log resource_monitor.jsonl --replay-path checkpoints/replay_16x16_n5_r4_f64.pkl
+```
+
+The audit emits a `bottleneck_assessment` block that classifies the run as
+`gpu_bound`, `cpu_bound`, `mcts_search_coordination_bound`, or `undetermined`
+from measured JSONL/GPU/resource evidence. When `--replay-path` is supplied, it
+also emits replay value-label and policy-target quality under `replay_quality`,
+plus a `decision_recommendation` that applies the project decision rules.
+
+For replay/data-quality evidence before changing search targets:
+
+```bash
+.venv/bin/python replay_audit.py checkpoints/replay_16x16_n5_r4_f64.pkl --max-samples 50000 --strategy tail
+```
+
+The replay audit reports value-label balance, draw fraction, policy target
+entropy, target sharpness, and a `replay_quality_assessment`.
+To compare policy-target sharpening/filtering candidates without changing
+training behavior or writing checkpoints, add `--probe-transforms`:
+
+```bash
+.venv/bin/python replay_audit.py checkpoints/replay_16x16_n5_r4_f64.pkl --max-samples 50000 --strategy tail --probe-transforms
+```
+
+The probe reports each candidate's max-prob/entropy deltas, retained original
+MCTS mass before renormalization, support size, top-1 agreement, and distortion
+metrics. Use it to shortlist one search-target rewrite before launching another
+remote run. Use a smaller `--max-samples` for quick iteration; the 50k replay
+tail is the source-of-truth slice and may take a few minutes to load and scan.
+The current `large_16x16_top_human_gpu` preset uses the conservative selected
+rewrite, `self_play_target_transform=top_k` with `self_play_target_top_k=16`.
+Future runs log transform diagnostics such as retained mass, support kept,
+top-1 change rate, max-prob delta, and normalized-entropy delta.
+New runs also log self-play target-quality scalars directly, such as
+`self_play/policy_target_diffuse_fraction`,
+`self_play/policy_target_normalized_entropy_mean`, and
+`self_play/value_target_draw_fraction`.
+
+To verify the required TensorBoard scalars are present for a preset:
+
+```bash
+.venv/bin/python tensorboard_audit.py --logdir checkpoints/tensorboard --preset large_16x16_top_human_gpu
+```
+
+For a one-command monitor health check before a long remote run:
+
+```bash
+.venv/bin/python remote_health_check.py
+```
+
+The health check verifies the tmux monitor sessions, TensorBoard HTTP,
+required training/resource TensorBoard scalars, fresh `resource_monitor.jsonl`,
+`nvidia-smi`, PyTorch CUDA availability, and the resolved self-play/eval worker
+counts for the GPU preset.
+
+For future remote runs, keep a CPU/GPU resource monitor beside TensorBoard:
+
+```bash
+.venv/bin/python resource_monitor.py --output resource_monitor.jsonl --interval 30
+```
+
+The monitor is cgroup-aware: `cpu_util_percent` is the training container's
+CPU usage against its allocated CPU quota, while `host_cpu_util_percent`
+captures host-wide pressure that may come from neighboring workloads. The
+large GPU preset uses `self_play_parallel_games="auto"` and
+`eval_parallel_games="auto"`, which resolve to the usable cgroup CPU worker
+count unless the CPU cap is explicitly disabled. The monitor also mirrors
+resource scalars to `checkpoints/tensorboard/resource_monitor` by default.
 
 ### Shopping baseline
 

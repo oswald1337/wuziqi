@@ -8,6 +8,10 @@ __pycache__/
 .DS_Store
 
 train.log
+train_console.log
+gpu_smi.log
+resource_monitor.jsonl
+*_smoke.log
 logs/
 wandb/
 checkpoints/

@@ -11,6 +11,12 @@ def run_improvement_loop(
     resume_best=True,
     rounds=1,
     stop_on_gate=True,
+    max_runtime_minutes=None,
+    max_runtime_dispatch_margin_minutes=None,
+    eval_n_playout=None,
+    opponent_eval_n_playout=None,
+    eval_mode="mcts",
+    opponent_eval_mode="mcts",
 ):
     presets = tuple(presets or IMPROVEMENT_PRESETS)
     rounds = max(1, int(rounds))
@@ -21,6 +27,8 @@ def run_improvement_loop(
                 preset=preset,
                 checkpoint_dir=checkpoint_dir,
                 resume_best=resume_best,
+                max_runtime_minutes=max_runtime_minutes,
+                max_runtime_dispatch_margin_minutes=max_runtime_dispatch_margin_minutes,
             )
             final = training_result["final"]
             evaluation_result = evaluate_checkpoint(
@@ -28,6 +36,10 @@ def run_improvement_loop(
                 registry_path=f"{checkpoint_dir}/registry.json",
                 games=eval_games,
                 previous_best_games=previous_best_games or eval_games,
+                n_playout=eval_n_playout,
+                opponent_n_playout=opponent_eval_n_playout,
+                eval_mode=eval_mode,
+                opponent_eval_mode=opponent_eval_mode,
                 promote=True,
             )
             result = {

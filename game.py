@@ -16,6 +16,23 @@ class Board:
         self.states = {}
         self.last_move = -1
 
+    def copy(self):
+        board = Board(self.width, self.height, self.n_in_row)
+        board.players = list(self.players)
+        if hasattr(self, "current_player"):
+            board.current_player = self.current_player
+        if hasattr(self, "availables"):
+            board.availables = list(self.availables)
+        board.states = dict(self.states)
+        if hasattr(self, "last_move"):
+            board.last_move = self.last_move
+        return board
+
+    def __deepcopy__(self, memo):
+        copied = self.copy()
+        memo[id(self)] = copied
+        return copied
+
     def move_to_location(self, move):
         """
         3*3 board's moves like:
@@ -42,7 +59,7 @@ class Board:
         """return the board state from the perspective of the current player.
         state shape: 4*width*height
         """
-        square_state = np.zeros((4, self.width, self.height))
+        square_state = np.zeros((4, self.width, self.height), dtype=np.float32)
         if self.states:
             moves, players = np.array(list(zip(*self.states.items())))
             move_curr = moves[players == self.current_player]

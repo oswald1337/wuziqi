@@ -207,6 +207,23 @@ def test_tensorboard_scalars_cover_self_play_and_eval_tags():
         "tactical_leaf_multiple_immediate_losses": 8,
         "dirichlet_noise_moves": 32,
         "no_noise_moves": 224,
+        "batched_policy_batches": 4,
+        "batched_policy_positions": 512,
+        "effective_mcts_batch_size": 64,
+        "policy_target_samples": 256,
+        "policy_target_max_prob_mean": 0.147,
+        "policy_target_entropy_mean": 4.4,
+        "policy_target_normalized_entropy_mean": 0.795,
+        "policy_target_diffuse_fraction": 0.84,
+        "policy_target_sharp_fraction": 0.138,
+        "policy_target_one_hot_fraction": 0.138,
+        "policy_target_transform_active": 1.0,
+        "policy_target_transform_retained_mass_mean": 0.248,
+        "policy_target_transform_support_kept_fraction_mean": 0.14,
+        "policy_target_transform_changed_top1_fraction": 0.0,
+        "policy_target_transform_max_prob_delta": 0.06,
+        "policy_target_transform_normalized_entropy_delta": -0.36,
+        "value_target_draw_fraction": 0.0,
         "buffer_size": 1024,
         "total_games": 8,
     }
@@ -242,6 +259,187 @@ def test_tensorboard_scalars_cover_self_play_and_eval_tags():
     assert self_play_scalars["self_play/tactical_leaf_multiple_immediate_losses"] == 8
     assert self_play_scalars["self_play/dirichlet_noise_moves"] == 32
     assert self_play_scalars["self_play/no_noise_moves"] == 224
+    assert self_play_scalars["self_play/batched_policy_batches"] == 4
+    assert self_play_scalars["self_play/batched_policy_positions"] == 512
+    assert self_play_scalars["self_play/effective_mcts_batch_size"] == 64
+    assert self_play_scalars["self_play/policy_target_samples"] == 256
+    assert self_play_scalars["self_play/policy_target_max_prob_mean"] == 0.147
+    assert self_play_scalars["self_play/policy_target_entropy_mean"] == 4.4
+    assert self_play_scalars["self_play/policy_target_normalized_entropy_mean"] == 0.795
+    assert self_play_scalars["self_play/policy_target_diffuse_fraction"] == 0.84
+    assert self_play_scalars["self_play/policy_target_sharp_fraction"] == 0.138
+    assert self_play_scalars["self_play/policy_target_one_hot_fraction"] == 0.138
+    assert self_play_scalars["self_play/policy_target_transform_active"] == 1.0
+    assert self_play_scalars["self_play/policy_target_transform_retained_mass_mean"] == 0.248
+    assert self_play_scalars["self_play/policy_target_transform_support_kept_fraction_mean"] == 0.14
+    assert self_play_scalars["self_play/policy_target_transform_changed_top1_fraction"] == 0.0
+    assert self_play_scalars["self_play/policy_target_transform_max_prob_delta"] == 0.06
+    assert self_play_scalars["self_play/policy_target_transform_normalized_entropy_delta"] == -0.36
+    assert self_play_scalars["self_play/value_target_draw_fraction"] == 0.0
     assert eval_scalars["eval/elo"] == 1134
     assert eval_scalars["eval/heuristic_score"] == 0.5625
     assert eval_scalars["eval/previous_best_score"] == 0.59375
+
+
+def test_tensorboard_scalars_cover_eval_opponent_progress_tags():
+    start_event = {
+        "event": "evaluation_opponent_start",
+        "opponent_key": "previous_best",
+        "games": 4,
+        "n_playout": 64,
+        "opponent_n_playout": 32,
+        "parallel_workers": 4,
+        "evaluation_elapsed_s": 1.25,
+        "games_trained": 28,
+    }
+    result_event = {
+        "event": "evaluation_opponent",
+        "opponent_key": "previous_best",
+        "games": 4,
+        "n_playout": 64,
+        "opponent_n_playout": 32,
+        "parallel_workers": 4,
+        "score": 0.625,
+        "wins": 2,
+        "draws": 1,
+        "losses": 1,
+        "failures": 0,
+        "duration_s": 12.5,
+        "avg_moves": 84.25,
+        "win_avg_moves": 72.0,
+        "draw_avg_moves": 101.0,
+        "loss_avg_moves": 92.0,
+        "evaluation_elapsed_s": 20.0,
+        "opponents_completed": 3,
+        "games_trained": 28,
+    }
+
+    start_scalars = tensorboard_scalars(start_event)
+    result_scalars = tensorboard_scalars(result_event)
+
+    assert start_scalars["eval/previous_best_started"] == 1.0
+    assert start_scalars["eval/previous_best_games"] == 4
+    assert start_scalars["eval/previous_best_candidate_playouts"] == 64
+    assert start_scalars["eval/previous_best_opponent_playouts"] == 32
+    assert result_scalars["eval/previous_best_score"] == 0.625
+    assert result_scalars["eval/previous_best_wins"] == 2
+    assert result_scalars["eval/previous_best_draws"] == 1
+    assert result_scalars["eval/previous_best_losses"] == 1
+    assert result_scalars["eval/previous_best_failures"] == 0
+    assert result_scalars["eval/previous_best_avg_moves"] == 84.25
+    assert result_scalars["eval/previous_best_win_avg_moves"] == 72.0
+    assert result_scalars["eval/previous_best_draw_avg_moves"] == 101.0
+    assert result_scalars["eval/previous_best_loss_avg_moves"] == 92.0
+    assert result_scalars["runtime/eval_previous_best_seconds"] == 12.5
+    assert result_scalars["runtime/eval_elapsed_seconds"] == 20.0
+    assert result_scalars["eval/opponents_completed"] == 3
+    assert tensorboard_step(result_event) == 28
+
+
+def test_tensorboard_scalars_cover_parallel_coordination_tags():
+    event = {
+        "event": "parallel_self_play_batch",
+        "parallel_workers": 12,
+        "parallel_batch_games": 8,
+        "parallel_games_per_second": 0.04,
+        "parallel_batch_duration_s": 200.0,
+        "parallel_wait_duration_s": 55.0,
+        "parallel_wait_calls": 16,
+        "parallel_wait_seconds_per_call": 3.4375,
+        "parallel_ready_events": 12,
+        "parallel_ready_pipes": 30,
+        "parallel_ready_pipes_per_event": 2.5,
+        "parallel_messages": 38,
+        "parallel_predict_messages": 30,
+        "parallel_game_result_messages": 8,
+        "parallel_coalesce_duration_s": 3.0,
+        "parallel_coalesce_calls": 7,
+        "parallel_coalesce_wait_calls": 9,
+        "parallel_coalesce_extra_pipes": 11,
+        "parallel_coalesce_extra_pipes_per_call": 11 / 7,
+        "parallel_coalesce_empty_waits": 4,
+        "parallel_coalesce_empty_wait_fraction": 4 / 9,
+        "parallel_coalesce_fraction": 0.015,
+        "parallel_payload_build_duration_s": 1.25,
+        "parallel_payload_build_fraction": 0.00625,
+        "parallel_request_state_bytes": 1152 * 4 * 16 * 16,
+        "parallel_request_state_bytes_per_position": 4 * 16 * 16,
+        "parallel_request_available_values": 12000,
+        "parallel_request_available_values_per_position": 12000 / 1152,
+        "parallel_compact_requests": 30,
+        "parallel_compact_request_fraction": 1.0,
+        "parallel_response_send_duration_s": 0.8,
+        "parallel_response_send_fraction": 0.004,
+        "parallel_response_build_duration_s": 0.18,
+        "parallel_response_build_fraction": 0.0009,
+        "parallel_response_pipe_send_duration_s": 0.62,
+        "parallel_response_pipe_send_fraction": 0.0031,
+        "parallel_response_probability_values": 6400,
+        "parallel_response_probability_values_per_request": 6400 / 30,
+        "parallel_compact_responses": 30,
+        "parallel_compact_response_fraction": 1.0,
+        "gpu_inference_requests": 30,
+        "gpu_inference_batches": 9,
+        "gpu_inference_positions": 1152,
+        "gpu_inference_duration_s": 40.0,
+        "gpu_inference_positions_per_batch": 128.0,
+        "gpu_inference_positions_per_request": 38.4,
+        "gpu_inference_batches_per_request": 0.3,
+        "gpu_inference_positions_per_second": 28.8,
+    }
+
+    scalars = tensorboard_scalars(event)
+
+    assert scalars["self_play/parallel_workers"] == 12
+    assert scalars["runtime/parallel_wait_calls"] == 16
+    assert scalars["runtime/parallel_wait_seconds_per_call"] == 3.4375
+    assert scalars["runtime/parallel_ready_pipes_per_event"] == 2.5
+    assert scalars["runtime/parallel_coalesce_seconds"] == 3.0
+    assert scalars["runtime/parallel_coalesce_calls"] == 7
+    assert scalars["runtime/parallel_coalesce_extra_pipes_per_call"] == 11 / 7
+    assert scalars["runtime/parallel_coalesce_empty_wait_fraction"] == 4 / 9
+    assert scalars["runtime/parallel_payload_build_seconds"] == 1.25
+    assert scalars["runtime/parallel_request_state_bytes_per_position"] == 4 * 16 * 16
+    assert scalars["runtime/parallel_request_available_values_per_position"] == 12000 / 1152
+    assert scalars["runtime/parallel_compact_request_fraction"] == 1.0
+    assert scalars["runtime/parallel_response_send_seconds"] == 0.8
+    assert scalars["runtime/parallel_response_build_seconds"] == 0.18
+    assert scalars["runtime/parallel_response_pipe_send_seconds"] == 0.62
+    assert scalars["runtime/parallel_response_probability_values_per_request"] == 6400 / 30
+    assert scalars["runtime/parallel_compact_response_fraction"] == 1.0
+    assert scalars["runtime/gpu_inference_positions_per_request"] == 38.4
+    assert scalars["runtime/gpu_inference_batches_per_request"] == 0.3
+
+
+def test_tensorboard_scalars_cover_runtime_budget_dispatch_tags():
+    event = {
+        "event": "runtime_budget",
+        "max_runtime_s": 600.0,
+        "runtime_dispatch_margin_s": 90.0,
+        "runtime_elapsed_s": 540.0,
+        "runtime_remaining_s": 60.0,
+        "runtime_budget_exceeded": False,
+        "runtime_dispatch_stopped": True,
+        "self_play_requested_games": 64,
+        "self_play_dispatched_games": 20,
+        "self_play_completed_games": 18,
+        "self_play_remaining_games": 46,
+        "self_play_stopped_early": True,
+        "self_play_stream_elapsed_s": 420.0,
+        "self_play_dispatch_stop_estimated_game_s": 75.0,
+        "total_games": 30,
+    }
+
+    scalars = tensorboard_scalars(event)
+
+    assert scalars["runtime/budget_max_seconds"] == 600.0
+    assert scalars["runtime/budget_dispatch_margin_seconds"] == 90.0
+    assert scalars["runtime/budget_elapsed_seconds"] == 540.0
+    assert scalars["runtime/budget_remaining_seconds"] == 60.0
+    assert scalars["runtime/budget_exceeded"] == 0.0
+    assert scalars["runtime/dispatch_stopped"] == 1.0
+    assert scalars["runtime/dispatch_stop_estimated_game_seconds"] == 75.0
+    assert scalars["self_play/dispatched_games"] == 20
+    assert scalars["self_play/completed_games"] == 18
+    assert scalars["self_play/stopped_early"] == 1.0
+    assert tensorboard_step(event) == 30
